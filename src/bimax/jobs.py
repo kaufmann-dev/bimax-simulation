@@ -20,15 +20,16 @@ class Jobs(QObject):
     finished = Signal(str, int, object)
     failed = Signal(str)
     busyChanged = Signal(bool)
-    _done = Signal()
+    _completed = Signal(str, int, object, str)
 
     def __init__(self, parent: QObject | None = None):
         super().__init__(parent)
         self.busy = False
         self._cancel = threading.Event()
+        self._process_lock = threading.Lock()
         self._process: subprocess.Popen | None = None
         self._thread: threading.Thread | None = None
-        self._done.connect(self._on_done)
+        self._completed.connect(self._on_completed)
 
     def submit(self, operation: str, document: Any = None, **kwargs: Any) -> None:
         if self.busy:
@@ -44,22 +45,37 @@ class Jobs(QObject):
 
     def cancel(self) -> None:
         self._cancel.set()
-        process = self._process
-        if process is not None and process.poll() is None:
-            process.terminate()
+        with self._process_lock:
+            process = self._process
+            if process is not None and process.poll() is None:
+                process.terminate()
 
     def close(self) -> None:
+        """Request shutdown without waiting on disk IO or a process on the GUI thread."""
         self.cancel()
-        if self._thread:
-            self._thread.join(timeout=5)
-        if self._process and self._process.poll() is None:
-            self._process.kill()
+        with self._process_lock:
+            if self._process and self._process.poll() is None:
+                self._process.kill()
 
-    def _on_done(self) -> None:
+    def _on_completed(self, operation: str, revision: int, result: Any, error: str) -> None:
+        # Cancellation can arrive after the worker finishes but before this queued
+        # delivery. Check it here, not only in the worker thread. Become idle before
+        # publishing completion so a result handler can submit its next operation.
+        cancelled = self._cancel.is_set()
         self.busy = False
+        if cancelled:
+            self.progress.emit("Computation cancelled.")
         self.busyChanged.emit(False)
+        if cancelled:
+            return
+        if error:
+            self.failed.emit(error)
+        elif result is not None:
+            self.finished.emit(operation, revision, result)
 
     def _run(self, operation: str, revision: int, doc: Any, kwargs: dict) -> None:
+        result = None
+        failure = ""
         try:
             with tempfile.TemporaryDirectory(prefix="bimax-job-") as directory:
                 path = Path(directory)
@@ -71,13 +87,16 @@ class Jobs(QObject):
                 environment = dict(os.environ)
                 environment.update(OPENBLAS_NUM_THREADS="1", OMP_NUM_THREADS="6")
                 with (path / "log.jsonl").open("w") as log:
-                    self._process = subprocess.Popen(
-                        [sys.executable, "-m", "bimax.worker", directory],
-                        stdout=log,
-                        stderr=subprocess.STDOUT,
-                        env=environment,
-                    )
-                    process = self._process
+                    with self._process_lock:
+                        if self._cancel.is_set():
+                            return
+                        self._process = subprocess.Popen(
+                            [sys.executable, "-m", "bimax.worker", directory],
+                            stdout=log,
+                            stderr=subprocess.STDOUT,
+                            env=environment,
+                        )
+                        process = self._process
                     monitor = psutil.Process(process.pid)
                     log_position = 0
                     while process.poll() is None:
@@ -87,6 +106,7 @@ class Jobs(QObject):
                                 process.wait(timeout=3)
                             except subprocess.TimeoutExpired:
                                 process.kill()
+                                process.wait()
                             return
                         try:
                             memory = monitor.memory_info().rss
@@ -120,12 +140,18 @@ class Jobs(QObject):
                     result = pickle.load(stream)  # private, locally generated worker result
                 if "error" in result:
                     raise RuntimeError(result["error"])
-                self.finished.emit(operation, revision, result)
         except Exception as error:
-            if not self._cancel.is_set():
-                self.failed.emit(str(error))
+            failure = str(error)
         finally:
-            self._process = None
-            if self._cancel.is_set():
-                self.progress.emit("Computation cancelled.")
-            self._done.emit()
+            with self._process_lock:
+                remaining_process, self._process = self._process, None
+            if remaining_process is not None:
+                if remaining_process.poll() is None:
+                    remaining_process.kill()
+                remaining_process.wait()
+            try:
+                self._completed.emit(operation, revision, result, failure)
+            except RuntimeError:
+                # The window may already have been destroyed after nonblocking
+                # close. Its computation has still been reaped and cleaned up.
+                pass

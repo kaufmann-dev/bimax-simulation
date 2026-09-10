@@ -7,7 +7,12 @@ import pytest
 from PySide6.QtCore import QPoint, Qt
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication
+from vtkmodules.util.numpy_support import numpy_to_vtk, vtk_to_numpy
+from vtkmodules.vtkCommonCore import vtkPoints
+from vtkmodules.vtkCommonDataModel import vtkCellArray, vtkPolyData
+from vtkmodules.vtkFiltersCore import vtkImplicitPolyDataDistance
 
+import bimax.surfaces as surfaces
 from bimax.model import Document, Geometry
 from bimax.surfaces import make_surfaces
 from bimax.views import FourViews, SliceView, sample_indices, world_bounds
@@ -42,14 +47,116 @@ def test_surfaces_close_volume_boundary_and_preserve_affine():
     geometry = Geometry((3, 4, 5), (0.5, 1.0, 2.0), (10, 20, 30), tuple(np.diag([-1.0, 1.0, 1.0]).ravel()))
     labels = np.ones(geometry.shape, dtype=np.uint8)
     original = labels.copy()
-    vertices, faces = make_surfaces(labels, geometry)[1]
+    mesh = make_surfaces(labels, geometry)[1]
+    vertices, faces = mesh.vertices, mesh.faces
     low, high = world_bounds(geometry)
     np.testing.assert_allclose(vertices.min(axis=0), low)
     np.testing.assert_allclose(vertices.max(axis=0), high)
     edges = np.sort(np.concatenate((faces[:, [0, 1]], faces[:, [1, 2]], faces[:, [2, 0]])), axis=1)
     _, counts = np.unique(edges, axis=0, return_counts=True)
     assert np.all(counts == 2), "A boundary object must produce a closed manifold"
+    np.testing.assert_allclose(np.linalg.norm(mesh.normals, axis=1), 1, atol=1e-6)
+    assert np.all(np.sum((vertices - (low + high) / 2) * mesh.normals, axis=1) > 0)
     np.testing.assert_array_equal(labels, original)
+
+
+def test_mesh_install_reuses_geometry_and_coalesces_native_renders(qapp):
+    doc = document()
+    widget = FourViews()
+    widget.resize(900, 700)
+    widget.show()
+    widget.initialize()
+    widget.set_document(doc)
+    meshes = make_surfaces(doc.anatomy, doc.geometry)
+    widget.set_surfaces(meshes)
+    QTest.qWait(100)
+    actor = widget.actors[2]
+    poly = actor.GetMapper().GetInput()
+    assert poly.GetPointData().GetNormals() is not None
+    assert np.shares_memory(vtk_to_numpy(poly.GetPoints().GetData()), meshes[2].vertices)
+    assert np.shares_memory(vtk_to_numpy(poly.GetPolys().GetConnectivityArray()), meshes[2].faces)
+    assert np.shares_memory(vtk_to_numpy(poly.GetPointData().GetNormals()), meshes[2].normals)
+    renders = []
+    widget.vtk.GetRenderWindow().AddObserver("StartEvent", lambda *_: renders.append(True))
+    widget.set_transforms({})
+    widget.set_pivot(None)
+    widget.set_landmarks([])
+    widget.set_plane([0, 0, 0], [0, 0, 1], False)
+    widget.set_surfaces(meshes)
+    assert not renders, "State setters must not synchronously render dense geometry"
+    QTest.qWait(100)
+    QTest.qWait(50)
+    assert len(renders) == 1
+    assert widget.actors[2] is actor
+    renders.clear()
+    previous_matrix = actor.GetUserMatrix()
+    widget.set_surfaces(meshes)
+    widget.set_transforms({})
+    QTest.qWait(40)
+    assert not renders, "Revisiting the same unchanged scene needs no native redraw"
+    assert actor.GetUserMatrix() is previous_matrix
+
+    widget.set_surfaces(meshes, fragment_mode=False)
+    anatomy_actor = widget.actors[2]
+    assert anatomy_actor is not actor
+    widget.set_surfaces(meshes, fragment_mode=True)
+    assert widget.actors[2] is actor
+    assert len(widget._scene_cache) == 2
+    replacement = make_surfaces(doc.anatomy, doc.geometry)
+    widget.set_surfaces(replacement, fragment_mode=True)
+    assert widget.actors[2] is not actor
+    assert len(widget._scene_cache) == 2, "Only one current scene is retained per mode"
+    current = widget.actors[2]
+    widget.invalidate_surfaces(False)
+    assert set(widget._scene_cache) == {True}
+    assert widget.actors[2] is current
+    widget.invalidate_surfaces(True)
+    assert not widget._scene_cache
+    assert not widget.actors
+    assert not widget.baseline_actors
+    assert not widget.renderer.HasViewProp(current)
+    widget.invalidate_surfaces(True)
+    widget.set_surfaces(replacement, fragment_mode=True)
+    widget.set_document(document())
+    assert not widget._scene_cache
+    assert not widget.actors
+    assert not widget.baseline_actors
+    renders.clear()
+    widget.request_render()
+    widget.close()
+    QTest.qWait(50)
+    assert not renders, "A queued update must not render a closed native window"
+
+
+def test_large_display_surface_preserves_topology_and_voxel_scale_geometry(monkeypatch):
+    geometry = Geometry((32, 32, 32), (0.4, 0.6, 0.8), (10, -7, 3), tuple(np.eye(3).ravel()))
+    coordinates = np.indices(geometry.shape) - 15.5
+    labels = (np.sum(coordinates**2, axis=0) <= 13**2).astype(np.uint8)
+    original_labels = labels.copy()
+    exact = make_surfaces(labels, geometry)[1]
+    monkeypatch.setattr(surfaces, "DISPLAY_TRIANGLE_TARGET", 300)
+    reduced = make_surfaces(labels, geometry)[1]
+    assert len(reduced.faces) < len(exact.faces)
+    # Topology/error constraints take precedence over the requested triangle target.
+    assert len(reduced.faces) > surfaces.DISPLAY_TRIANGLE_TARGET
+    edges = np.sort(np.concatenate([reduced.faces[:, pair] for pair in ([0, 1], [1, 2], [2, 0])]), axis=1)
+    unique_edges, edge_counts = np.unique(edges, axis=0, return_counts=True)
+    assert np.all(edge_counts == 2)
+    assert len(reduced.vertices) - len(unique_edges) + len(reduced.faces) == 2
+    for reference, candidate in ((exact, reduced), (reduced, exact)):
+        points = vtkPoints()
+        points.SetData(numpy_to_vtk(reference.vertices, deep=False))
+        faces = vtkCellArray()
+        faces.SetData(3, numpy_to_vtk(reference.faces.ravel(), deep=False))
+        poly = vtkPolyData()
+        poly.SetPoints(points)
+        poly.SetPolys(faces)
+        distance = vtkImplicitPolyDataDistance()
+        distance.SetInput(poly)
+        samples = np.concatenate((candidate.vertices, candidate.vertices[candidate.faces].mean(axis=1)))
+        maximum = max(abs(distance.EvaluateFunction(point)) for point in samples)
+        assert maximum <= min(geometry.spacing) * 0.25 + 1e-5
+    np.testing.assert_array_equal(labels, original_labels)
 
 
 @pytest.mark.parametrize("orientation", [0, 1, 2])

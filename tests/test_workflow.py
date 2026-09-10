@@ -10,6 +10,7 @@ import numpy as np
 import pytest
 import SimpleITK as sitk
 from PySide6.QtCore import Qt
+from PySide6.QtGui import QCloseEvent
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QFileDialog, QInputDialog, QMessageBox
 
@@ -20,6 +21,11 @@ from bimax.jobs import Jobs
 from bimax.model import Document, Geometry, new_scenario
 from bimax.storage import load_project, save_project
 from bimax.surfaces import make_surfaces
+
+
+@pytest.fixture(autouse=True)
+def isolated_display_cache(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
 
 
 @pytest.fixture(scope="module")
@@ -82,15 +88,157 @@ def synthetic_document(assigned=False, fragments=False):
 
 def install_document(window, doc):
     labels = doc.fragments if doc.fragments is not None else doc.anatomy
+    sets = {False: make_surfaces(doc.anatomy, doc.geometry)}
+    if doc.fragments is not None:
+        sets[True] = make_surfaces(labels, doc.geometry)
     window._job_finished(
         "open",
         -1,
         {
             "document": doc,
-            "surfaces": make_surfaces(labels, doc.geometry),
+            "surface_sets": sets,
+            "anatomy_counts": np.bincount(doc.anatomy.ravel(), minlength=5),
             "fragment_mode": doc.fragments is not None,
         },
     )
+
+
+def test_cached_stage_changes_and_movement_undo_do_not_submit_jobs(window, monkeypatch):
+    doc = synthetic_document(assigned=True, fragments=True)
+    install_document(window, doc)
+    counts = window._anatomy_counts.copy()
+    fragment_actor = window.views.actors[5]
+    monkeypatch.setattr(
+        window.jobs, "submit", lambda *args, **kwargs: pytest.fail("cached scene must not remesh")
+    )
+    for stage in [0, 1, 2, 3, 1, 3]:
+        window.tabs.setCurrentIndex(stage)
+    assert window.views.actors[5] is fragment_actor
+    window.motion_spins[1].setValue(3)
+    window._finish_motion_edit()
+    window._undo(False)
+    window._undo(True)
+    assert doc.motions["linked"].translation == [0, 3, 0]
+    assert window.views.actors[5] is fragment_actor
+    np.testing.assert_array_equal(window._anatomy_counts, counts)
+
+
+def test_accept_separation_reuses_precomputed_labels_meshes_and_counts(window, monkeypatch):
+    from bimax.worker import execute
+
+    doc = synthetic_document()
+    install_document(window, doc)
+    window.tabs.setCurrentIndex(1)
+    doc.seeds[4, 4, 4], doc.seeds[18, 4, 4] = 3, 2
+    result = execute("separate", doc, {})
+    window._job_finished("separate", doc.revision, result)
+    before = doc.anatomy
+    preview_actor = window.views.actors[3]
+    monkeypatch.setattr(
+        window.jobs, "submit", lambda *args, **kwargs: pytest.fail("accept must reuse preview")
+    )
+    monkeypatch.setattr(
+        np, "flatnonzero", lambda *args, **kwargs: pytest.fail("accept must not scan labelmaps")
+    )
+    window.accept_separation_button.click()
+    assert doc.anatomy is result["proposal"]
+    assert window.history.undo_stack[-1].before["anatomy"] is before
+    assert window.views.actors[3] is preview_actor
+    assert window._loaded_meshes[False] is result["surfaces"]
+    assert window._anatomy_counts is result["anatomy_counts"]
+    assert not window._remesh_timer.isActive()
+    assert doc.fragments is None
+
+
+def test_seed_edit_discards_preview_without_rebuilding_accepted_anatomy(window, monkeypatch):
+    from bimax.worker import execute
+
+    doc = synthetic_document(assigned=True)
+    install_document(window, doc)
+    window.tabs.setCurrentIndex(1)
+    accepted_meshes = window._loaded_meshes[False]
+    doc.seeds[4, 4, 4], doc.seeds[18, 4, 4] = 3, 3
+    result = execute("separate", doc, {})
+    window._job_finished("separate", doc.revision, result)
+    assert set(window.views.actors) == {3}
+    monkeypatch.setattr(
+        window.jobs, "submit", lambda *args, **kwargs: pytest.fail("seed edits must not remesh")
+    )
+    index = np.array([np.ravel_multi_index((18, 4, 4), doc.geometry.shape)])
+    window._apply_array_edit("Paint seeds", "seeds", index, 2)
+    assert window.pending_separation is None
+    assert window._loaded_meshes[False] is accepted_meshes
+    assert set(window.views.actors) == {2, 3}
+    assert not window._remesh_timer.isActive()
+
+
+def test_cut_acceptance_reuses_preview_and_cut_edit_discards_actors(window, monkeypatch):
+    from bimax.worker import execute
+
+    doc = synthetic_document(assigned=True)
+    doc.cuts["lefort"]["enabled"] = True
+    doc.cuts["lefort"]["plane"]["origin"][2] = 18
+    install_document(window, doc)
+    window.tabs.setCurrentIndex(2)
+    result = execute("cuts_preview", doc, {})
+    window._job_finished("cuts_preview", doc.revision, result)
+    xyz = np.argwhere(result["fragments"] == 2)[0][::-1]
+    doc.confirmations["2"] = doc.world_to_plan(doc.geometry.index_to_world(xyz)).tolist()
+    actor = window.views.actors[2]
+    monkeypatch.setattr(
+        window.jobs, "submit", lambda *args, **kwargs: pytest.fail("accept must reuse preview")
+    )
+    window.accept_cuts_button.click()
+    assert window._test_errors == []
+    assert doc.fragments is result["fragments"]
+    assert window.views.actors[2] is actor
+    assert window.tabs.currentIndex() == 3
+    window.tabs.setCurrentIndex(2)
+    window.cut_enabled.setChecked(False)
+    assert doc.fragments is None
+    assert not window.views.fragment_mode
+    assert set(window.views.actors) == {2, 3}
+    assert True not in window.views._scene_cache
+
+
+def test_labelmap_replacement_history_restores_sparse_edits_before_swapping():
+    doc = synthetic_document(assigned=True)
+    history = History()
+    first = doc.anatomy
+    first_value = first.copy()
+    second = first.copy()
+    second[second == 2] = 3
+    second_value = second.copy()
+    doc.anatomy = second
+    history.push(Edit("Replace anatomy", [], {"anatomy": first}, {"anatomy": second}))
+    indices = np.array([np.ravel_multi_index((18, 4, 4), doc.geometry.shape)])
+    before = second.ravel()[indices].copy()
+    after = np.array([4], dtype=np.uint8)
+    second.ravel()[indices] = after
+    history.push(Edit("Paint", [("anatomy", indices, before, after)], {}, {}))
+    assert history.apply(doc, False)
+    np.testing.assert_array_equal(second, second_value)
+    assert history.apply(doc, False)
+    assert doc.anatomy is first
+    np.testing.assert_array_equal(first, first_value)
+    assert history.apply(doc, True)
+    assert doc.anatomy is second
+    assert history.apply(doc, True)
+    assert doc.anatomy.ravel()[indices[0]] == 4
+    assert history.apply(doc, False)
+    assert history.apply(doc, False)
+    first.ravel()[indices] = 1
+    history.push(
+        Edit(
+            "New branch",
+            [("anatomy", indices, np.array([2], dtype=np.uint8), np.array([1], dtype=np.uint8))],
+            {},
+            {},
+        )
+    )
+    assert not history.redo_stack
+    assert history.apply(doc, False)
+    np.testing.assert_array_equal(doc.anatomy, first_value)
 
 
 def write_input(doc, path):
@@ -522,6 +670,37 @@ def test_cancelling_close_save_does_not_close_on_later_save(window, qapp, tmp_pa
     assert window._test_errors == []
     assert closed == []
     assert not window.dirty
+
+
+def test_busy_close_waits_asynchronously_then_preserves_unsaved_prompt(window, qapp, monkeypatch):
+    install_document(window, synthetic_document(assigned=True))
+    window.dirty = True
+    window.jobs.busy = True
+    prompts, cancellations = [], []
+
+    def answer(parent, title, *args):
+        prompts.append(title)
+        if title == "Computation running":
+            return QMessageBox.StandardButton.Yes
+        assert not window.jobs.busy
+        return QMessageBox.StandardButton.Cancel
+
+    monkeypatch.setattr(QMessageBox, "question", answer)
+    monkeypatch.setattr(window.jobs, "close", lambda: cancellations.append(True))
+    event = QCloseEvent()
+    window.closeEvent(event)
+    assert not event.isAccepted()
+    assert window._close_after_cancel
+    assert prompts == ["Computation running"]
+    assert cancellations == [True]
+    window.jobs._cancel.set()
+    window.jobs.busy = False
+    window._busy_changed(False)
+    wait_until(qapp, lambda: len(prompts) == 2)
+    assert prompts == ["Computation running", "Unsaved project"]
+    assert window.isVisible()
+    assert window.dirty
+    assert not window._close_after_cancel
 
 
 def test_failed_open_preserves_previous_project_save_target(window, qapp, tmp_path):

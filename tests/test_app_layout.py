@@ -51,7 +51,8 @@ def window(qapp):
     doc.cuts = default_cuts(doc)
     result._job_finished("open", -1, {
         "document": doc,
-        "surfaces": make_surfaces(anatomy, geometry),
+        "surface_sets": {False: make_surfaces(anatomy, geometry)},
+        "anatomy_counts": np.bincount(anatomy.ravel(), minlength=5),
         "fragment_mode": False,
     })
     QTest.qWait(30)

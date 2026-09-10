@@ -121,10 +121,15 @@ class MainWindow(QMainWindow):
         self.loading = False
         self.pending_separation = None
         self.pending_fragments = None
+        self._separation_meshes = None
+        self._separation_counts = None
+        self._fragment_meshes = None
+        self._fragment_counts = None
         self.pick_mode = None
         self.last_point = None
         self.selected_fragment = 1
         self._after_save = None
+        self._close_after_cancel = False
         self._loaded_meshes = {}
         self._anatomy_counts = None
         self._remesh_timer = QTimer(self)
@@ -192,7 +197,9 @@ class MainWindow(QMainWindow):
         self.expand_3d_action = QAction("Expand 3D", self)
         self.expand_3d_action.setCheckable(True)
         self.expand_3d_action.setShortcut(QKeySequence("F11"))
-        self.expand_3d_action.setToolTip("Expand the 3D workspace (F11). Keep the sidebar available.")
+        self.expand_3d_action.setToolTip(
+            "Expand the 3D workspace (F11). Keep the sidebar available."
+        )
         self.expand_3d_action.toggled.connect(self._expand_3d)
         toolbar.addAction(self.expand_3d_action)
         self.restore_views_action = QAction("Restore four views", self)
@@ -430,9 +437,11 @@ class MainWindow(QMainWindow):
         if not busy and self.jobs._cancel.is_set():
             self._after_save = None
         self._sync_enabled()
+        if not busy and self._close_after_cancel:
+            self._close_after_cancel = False
+            QTimer.singleShot(0, self.close)
 
     def _display(self, meshes, fragment_mode, labels=None):
-        self._loaded_meshes[fragment_mode] = meshes
         self.views.set_surfaces(meshes, fragment_mode=fragment_mode)
         if labels is not None:
             self.views.refresh_slices(labels)
@@ -502,8 +511,13 @@ class MainWindow(QMainWindow):
             self.doc.confirmations = {}
         self.pending_fragments = None
         self.pending_separation = None
+        self._separation_meshes = self._separation_counts = None
+        self._fragment_meshes = self._fragment_counts = None
         self._loaded_meshes.pop(True, None)
+        self.views.invalidate_surfaces(True)
         self.views.set_transforms({})
+        if self.doc is not None:
+            self._display(self._loaded_meshes.get(False, {}), False, self.doc.anatomy)
         self.confirm_label.setText(
             "Confirm the enabled fragments by picking a point inside each one."
         )
@@ -590,13 +604,15 @@ class MainWindow(QMainWindow):
             assert self.doc is not None
             self.doc.source.setflags(write=False)
             self.project_path = result.get("path") if operation == "open" else None
-            self._loaded_meshes.clear()
-            self._anatomy_counts = None
+            self._loaded_meshes = result["surface_sets"]
+            self._anatomy_counts = result["anatomy_counts"]
             self.history = History()
             self.pending_separation = self.pending_fragments = None
+            self._separation_meshes = self._separation_counts = None
+            self._fragment_meshes = self._fragment_counts = None
             self.dirty = operation == "import"
             self.views.set_document(self.doc)
-            self._display(result["surfaces"], result["fragment_mode"])
+            self._display(self._loaded_meshes[result["fragment_mode"]], result["fragment_mode"])
             self.views.set_label(self.label_combo.currentData())
             self.views.set_brush_mm(self.brush_spin.value())
             self._load_document_controls()
@@ -607,30 +623,24 @@ class MainWindow(QMainWindow):
             self._status("Volume ready. Source voxels and physical geometry are preserved.")
         elif operation == "separate":
             self.pending_separation = result["proposal"]
+            self._separation_meshes = result["surfaces"]
+            self._separation_counts = result["anatomy_counts"]
             self._display(result["surfaces"], False, self.pending_separation)
             self._status("Separation proposal ready. Inspect the slices, then accept or discard.")
-        elif operation.startswith("cuts_"):
+        elif operation == "cuts_preview":
             self.pending_fragments = result["fragments"]
+            self._fragment_meshes = result["surfaces"]
+            self._fragment_counts = result["fragment_counts"]
             self._display(result["surfaces"], True, self.pending_fragments)
             self.views.set_transforms({})
-            if operation == "cuts_accept":
-                assert self.doc is not None
-                self.doc.fragments = self.pending_fragments
-                self.pending_fragments = None
-                self._mark_dirty()
-                self.tabs.setCurrentIndex(3)
-                self._update_transforms()
-                self._status(
-                    "Cuts accepted. Move fragments with numeric controls and a visible pivot."
-                )
-            else:
-                self._status(
-                    "Fragment preview ready. Identify the enabled pieces, then accept the cuts."
-                )
+            self._status(
+                "Fragment preview ready. Identify the enabled pieces, then accept the cuts."
+            )
         elif operation == "surfaces":
-            self._display(result["surfaces"], result["fragment_mode"])
-            self.views.refresh_slices()
-            self._update_transforms()
+            self._loaded_meshes[result["fragment_mode"]] = result["surfaces"]
+            self._anatomy_counts = result["anatomy_counts"]
+            self._assignment_counts()
+            self._stage_changed(self.tabs.currentIndex())
             self._status("Display surfaces updated.")
         elif operation == "component":
             self._apply_array_edit(
@@ -685,11 +695,8 @@ class MainWindow(QMainWindow):
         if self.doc is None:
             return
         if self._anatomy_counts is None:
-            counts = np.zeros(5, dtype=np.int64)
-            flat = self.doc.anatomy.reshape(-1)
-            for start in range(0, flat.size, 1_000_000):
-                counts += np.bincount(flat[start : start + 1_000_000], minlength=5)
-            self._anatomy_counts = counts
+            self.assignment_label.setText("Updating assignment counts in the background…")
+            return
         counts = self._anatomy_counts
         self.assignment_label.setText(
             " · ".join(f"{ANATOMY[i]}: {counts[i]:,}" for i in range(1, 5))
@@ -741,13 +748,15 @@ class MainWindow(QMainWindow):
             self._anatomy_counts += np.bincount(after, minlength=5) - np.bincount(
                 before, minlength=5
             )
+        if field == "anatomy":
+            self._loaded_meshes.pop(False, None)
         self._invalidate()
-        self._loaded_meshes.pop(False, None)
         self._remember(name, {}, {}, [(field, indices, before, after)])
         self.views.refresh_slices()
         self._assignment_counts()
         self._status("Edit applied. Refresh 3D surfaces when ready.")
-        self._remesh_timer.start(1200)
+        if field == "anatomy":
+            self._remesh_timer.start(1200)
 
     def _roi(self):
         assert self.doc is not None
@@ -788,12 +797,20 @@ class MainWindow(QMainWindow):
         assert self.doc is not None
         if self.pending_separation is None:
             return
-        proposal = self.pending_separation
-        indices = np.flatnonzero(self.doc.anatomy.reshape(-1) != proposal.reshape(-1))
-        self._apply_array_edit(
-            "Accept separation", "anatomy", indices, proposal.reshape(-1)[indices]
+        proposal, meshes, counts = (
+            self.pending_separation,
+            self._separation_meshes,
+            self._separation_counts,
         )
-        self.pending_separation = None
+        before = self.doc.anatomy
+        self.doc.anatomy = proposal
+        self._loaded_meshes[False] = meshes
+        self._invalidate()
+        self._anatomy_counts = counts
+        self._remember("Accept separation", {"anatomy": before}, {"anatomy": proposal})
+        self._remesh_timer.stop()
+        self._display(meshes, False)
+        self._assignment_counts()
         self._sync_enabled()
         self._status(
             "Separation accepted. Resolve unassigned bone or mark it excluded before cutting."
@@ -801,13 +818,18 @@ class MainWindow(QMainWindow):
 
     def _discard_proposal(self):
         self.pending_separation = None
-        self.views.refresh_slices()
-        self._refresh_surfaces()
+        self._separation_meshes = self._separation_counts = None
+        self._stage_changed(self.tabs.currentIndex())
         self._sync_enabled()
 
     def _refresh_surfaces(self):
         if self.doc and not self.jobs.busy:
-            self.jobs.submit("surfaces", self.doc, anatomy=self.tabs.currentIndex() == 1)
+            self._remesh_timer.stop()
+            mode = self.doc.fragments is not None and self.tabs.currentIndex() != 1
+            if mode in self._loaded_meshes:
+                self._stage_changed(self.tabs.currentIndex())
+                return
+            self.jobs.submit("surfaces", self.doc, anatomy=not mode)
 
     def _stage_changed(self, index):
         if self.doc is None:
@@ -815,25 +837,27 @@ class MainWindow(QMainWindow):
         self.pick_mode = None
         self.views.set_tool("navigate")
         self.views.set_plane([0, 0, 0], [0, 0, 1], False)
-        if index == 1:
-            self.views.set_transforms({})
-            if False in self._loaded_meshes:
-                self._display(self._loaded_meshes[False], False)
-            self.views.fragment_mode = False
-            if False not in self._loaded_meshes and not self.jobs.busy:
+        mode = self.doc.fragments is not None and index != 1
+        labels = self.doc.fragments if mode else self.doc.anatomy
+        meshes = self._loaded_meshes.get(mode)
+        if index == 1 and self.pending_separation is not None:
+            meshes, labels = self._separation_meshes, self.pending_separation
+        elif index == 2 and self.pending_fragments is not None:
+            mode, meshes, labels = True, self._fragment_meshes, self.pending_fragments
+        if meshes is not None:
+            self._display(meshes, mode, labels)
+        else:
+            # Do not leave a stale cut scene selectable while its replacement is built.
+            self._display({}, mode, labels)
+            if not self.jobs.busy:
                 self._refresh_surfaces()
-            self._tool_changed()
-            self.views.refresh_slices(
-                self.pending_separation if self.pending_separation is not None else self.doc.anatomy
-            )
-        elif index == 2:
+        if index != 3:
             self.views.set_transforms({})
-            if True in self._loaded_meshes:
-                self._display(self._loaded_meshes[True], True, self.pending_fragments)
+        if index == 1:
+            self._tool_changed()
+        elif index == 2:
             self._load_plane_controls()
         elif index == 3:
-            if self.doc.fragments is not None and True in self._loaded_meshes:
-                self._display(self._loaded_meshes[True], True)
             self._load_motion()
             self._update_transforms()
 
@@ -949,9 +973,38 @@ class MainWindow(QMainWindow):
         self._plane_controls_changed()
 
     def _build_cuts(self, accepted):
-        if self.doc is None:
+        if self.doc is None or self.jobs.busy:
             return
-        self.jobs.submit("cuts_accept" if accepted else "cuts_preview", self.doc)
+        if accepted:
+            if (
+                self.pending_fragments is None
+                or self._fragment_counts is None
+                or self._anatomy_counts is None
+            ):
+                return
+            from .engine import validate_fragment_preview
+
+            try:
+                validate_fragment_preview(
+                    self.doc, self.pending_fragments, self._fragment_counts, self._anatomy_counts
+                )
+            except ValueError as error:
+                self._error(str(error))
+                return
+            self.doc.fragments = self.pending_fragments
+            self._loaded_meshes[True] = self._fragment_meshes
+            self.pending_fragments = None
+            self._fragment_meshes = self._fragment_counts = None
+            self._remesh_timer.stop()
+            self._mark_dirty()
+            if self.tabs.currentIndex() == 3:
+                self._stage_changed(3)
+            else:
+                self.tabs.setCurrentIndex(3)
+            self._sync_enabled()
+            self._status("Cuts accepted. Move fragments with numeric controls and a visible pivot.")
+            return
+        self.jobs.submit("cuts_preview", self.doc)
         self._status("Partitioning bone fragments at native resolution…")
 
     def _arm_pick(self, mode):
@@ -1267,13 +1320,34 @@ class MainWindow(QMainWindow):
         if self.doc is None or self.jobs.busy:
             return
         self._finish_motion_edit()
+        stack = self.history.redo_stack if forward else self.history.undo_stack
+        if not stack:
+            return
+        edit = stack[-1]
+        anatomy_changed = "anatomy" in edit.before or any(
+            patch[0] == "anatomy" for patch in edit.patches
+        )
         if self.history.apply(self.doc, forward):
-            self._anatomy_counts = None
+            if anatomy_changed:
+                self._loaded_meshes.pop(False, None)
+                if "anatomy" in edit.before:
+                    self._anatomy_counts = None
+                elif self._anatomy_counts is not None:
+                    for field, _, before, after in edit.patches:
+                        if field == "anatomy":
+                            delta = np.bincount(after, minlength=5) - np.bincount(
+                                before, minlength=5
+                            )
+                            self._anatomy_counts += delta if forward else -delta
+            if self.doc.fragments is None:
+                self._loaded_meshes.pop(True, None)
+                self.views.invalidate_surfaces(True)
             self.pending_fragments = self.pending_separation = None
+            self._separation_meshes = self._separation_counts = None
+            self._fragment_meshes = self._fragment_counts = None
             self._mark_dirty()
             self._load_document_controls()
-            self.views.refresh_slices()
-            self._refresh_surfaces()
+            self._stage_changed(self.tabs.currentIndex())
 
     def closeEvent(self, event):
         if self.jobs.busy:
@@ -1287,7 +1361,10 @@ class MainWindow(QMainWindow):
             if answer != QMessageBox.StandardButton.Yes:
                 event.ignore()
                 return
+            event.ignore()
+            self._close_after_cancel = True
             self.jobs.close()
+            return
         if self.dirty:
             answer = QMessageBox.question(
                 self,

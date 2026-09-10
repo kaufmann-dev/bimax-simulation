@@ -16,7 +16,10 @@ class Edit:
 
     @property
     def size(self):
-        return sum(i.nbytes + b.nbytes + a.nbytes for _, i, b, a in self.patches)
+        replacements = sum(
+            values["anatomy"].nbytes for values in (self.before, self.after) if "anatomy" in values
+        )
+        return replacements + sum(i.nbytes + b.nbytes + a.nbytes for _, i, b, a in self.patches)
 
 
 class History:
@@ -41,8 +44,10 @@ class History:
         for field, indices, before, after in edit.patches:
             getattr(doc, field).reshape(-1)[indices] = after if forward else before
         for field, value in (edit.after if forward else edit.before).items():
-            setattr(doc, field, deepcopy(value))
-        if edit.patches or "cuts" in edit.before or "frame" in edit.before:
+            # Labelmap replacement is O(1). Later sparse edits are undone first,
+            # restoring these arrays before history crosses the replacement.
+            setattr(doc, field, value if field == "anatomy" else deepcopy(value))
+        if edit.patches or any(field in edit.before for field in ("anatomy", "cuts", "frame")):
             doc.fragments = None
             doc.confirmations = {}
         if doc.active_scenario not in doc.scenarios:

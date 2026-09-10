@@ -6,10 +6,17 @@ import sys
 from pathlib import Path
 
 
+def anatomy_counts(labels):
+    """Count labels off the GUI thread with bounded temporary allocations."""
+    from .engine import label_counts
+
+    return label_counts(labels, 4)
+
+
 def execute(operation, doc, options):
-    from .engine import build_fragments, default_cuts, load_volume, separate
+    from .engine import build_fragments, default_cuts, label_counts, load_volume, separate
     from .storage import export_labelmaps, load_project, save_project
-    from .surfaces import make_surfaces
+    from .surface_cache import cached_surfaces
 
     def progress(fraction, message):
         print(
@@ -17,7 +24,7 @@ def execute(operation, doc, options):
         )
 
     def surfaces(labels):
-        return make_surfaces(labels, doc.geometry, progress=lambda message: progress(0, message))
+        return cached_surfaces(labels, doc.geometry, progress=lambda message: progress(0, message))
 
     if operation in ("import", "open"):
         doc = (
@@ -27,25 +34,39 @@ def execute(operation, doc, options):
         )
         if not doc.cuts:
             doc.cuts = default_cuts(doc)
-        labels = doc.fragments if doc.fragments is not None else doc.anatomy
+        progress(0, "Building anatomy display")
+        surface_sets = {False: surfaces(doc.anatomy)}
+        if doc.fragments is not None:
+            progress(0, "Building fragment display")
+            surface_sets[True] = surfaces(doc.fragments)
         return {
             "document": doc,
-            "surfaces": surfaces(labels),
+            "surface_sets": surface_sets,
             "fragment_mode": doc.fragments is not None,
             "path": options["path"],
+            "anatomy_counts": anatomy_counts(doc.anatomy),
         }
     if operation == "separate":
         labels = separate(doc, roi=options.get("roi"), progress=progress)
-        return {"proposal": labels, "surfaces": surfaces(labels)}
-    if operation in ("cuts_preview", "cuts_accept"):
-        labels = build_fragments(doc, validate=operation == "cuts_accept", progress=progress)
-        return {"fragments": labels, "surfaces": surfaces(labels)}
+        return {
+            "proposal": labels,
+            "surfaces": surfaces(labels),
+            "anatomy_counts": anatomy_counts(labels),
+        }
+    if operation == "cuts_preview":
+        labels = build_fragments(doc, validate=False, progress=progress)
+        return {
+            "fragments": labels,
+            "surfaces": surfaces(labels),
+            "fragment_counts": label_counts(labels, 8),
+        }
     if operation == "surfaces":
         fragment_mode = doc.fragments is not None and not options.get("anatomy", False)
         labels = doc.fragments if fragment_mode else doc.anatomy
         return {
             "surfaces": surfaces(labels),
             "fragment_mode": fragment_mode,
+            "anatomy_counts": anatomy_counts(doc.anatomy),
         }
     if operation == "component":
         from .engine import component_indices

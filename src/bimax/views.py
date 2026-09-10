@@ -21,11 +21,10 @@ from PySide6.QtGui import (
 from PySide6.QtWidgets import QGridLayout, QLabel, QSlider, QVBoxLayout, QWidget
 from scipy.ndimage import binary_dilation
 from vtkmodules.qt.QVTKRenderWindowInteractor import QVTKRenderWindowInteractor
-from vtkmodules.util.numpy_support import numpy_to_vtk, numpy_to_vtkIdTypeArray
+from vtkmodules.util.numpy_support import numpy_to_vtk
 from vtkmodules.vtkCommonCore import vtkCommand, vtkPoints
 from vtkmodules.vtkCommonDataModel import vtkCellArray, vtkPlane, vtkPolyData
 from vtkmodules.vtkCommonMath import vtkMatrix4x4
-from vtkmodules.vtkFiltersCore import vtkPolyDataNormals
 from vtkmodules.vtkFiltersSources import vtkSphereSource
 from vtkmodules.vtkInteractionStyle import vtkInteractorStyleTrackballCamera
 from vtkmodules.vtkInteractionWidgets import vtkImplicitPlaneRepresentation, vtkImplicitPlaneWidget2
@@ -448,6 +447,12 @@ class FourViews(QWidget):
         self.sliders: list[QSlider] = []
         self.actors: dict[int, vtkActor] = {}
         self.baseline_actors: dict[int, vtkActor] = {}
+        # One immutable scene per interpretation; stage navigation keeps the
+        # same actors, mappers and uploaded GPU buffers. A replacement evicts
+        # that mode's previous scene, and a new document clears both modes.
+        self._scene_cache: dict[
+            bool, tuple[dict[int, Mesh], dict[int, vtkActor], dict[int, vtkActor]]
+        ] = {}
         self.transforms: dict[int, np.ndarray] = {}
         self._visibility: dict[bool, dict[int, bool]] = {False: {}, True: {}}
         self.landmark_actors: list[vtkCaptionActor2D] = []
@@ -529,11 +534,17 @@ class FourViews(QWidget):
         else:
             self._grid.addWidget(self._vtk_panel, 1, 1)
         self._grid.activate()
-        self.vtk.GetRenderWindow().Render()
+        self.request_render()
 
     def initialize(self) -> None:
         self.vtk.Initialize()
-        self.vtk.GetRenderWindow().Render()
+        self.request_render()
+
+    def request_render(self) -> None:
+        """Let Qt coalesce state changes and exposes into one native paint."""
+        # QVTK's paintEvent renders the native scene. A separate render timer
+        # would draw it again when the queued Qt paint is subsequently handled.
+        self.vtk.update()
 
     @staticmethod
     def _make_caption(name: str, color: tuple[float, float, float]) -> vtkCaptionActor2D:
@@ -571,7 +582,7 @@ class FourViews(QWidget):
         for view in self.slices:
             view._pivot = point
             view.update()
-        self.vtk.GetRenderWindow().Render()
+        self.request_render()
 
     def set_landmarks(self, landmarks: list[dict[str, Any]]) -> None:
         """Accept named baseline ``point`` and transformed ``moved`` LPS points."""
@@ -586,7 +597,7 @@ class FourViews(QWidget):
         for view in self.slices:
             view._landmarks = landmarks
             view.update()
-        self.vtk.GetRenderWindow().Render()
+        self.request_render()
 
     def set_visibility(self, label: int, visible: bool) -> None:
         """Toggle a 3D surface; slice ownership remains available for editing."""
@@ -594,12 +605,17 @@ class FourViews(QWidget):
         if label in self.actors:
             self.actors[label].SetVisibility(visible)
             self.baseline_actors[label].SetVisibility(visible and self._baseline)
-        self.vtk.GetRenderWindow().Render()
+        self.request_render()
 
     def is_visible(self, label: int) -> bool:
         return self._visibility[self.fragment_mode].get(label, True)
 
     def set_document(self, document: Document) -> None:
+        for actor in list(self.actors.values()) + list(self.baseline_actors.values()):
+            self.renderer.RemoveActor(actor)
+        self.actors = {}
+        self.baseline_actors = {}
+        self._scene_cache.clear()
         self.document = document
         self.transforms = {}
         self._visibility = {False: {}, True: {}}
@@ -676,37 +692,67 @@ class FourViews(QWidget):
             view.brush_mm = max(0.1, float(diameter))
             view.update()
 
+    def invalidate_surfaces(self, fragment_mode: bool) -> None:
+        """Release stale display geometry, including its selectable actors."""
+        cached = self._scene_cache.pop(fragment_mode, None)
+        if cached is not None and self.actors is cached[1]:
+            for actor in list(self.actors.values()) + list(self.baseline_actors.values()):
+                self.renderer.RemoveActor(actor)
+            self.actors = {}
+            self.baseline_actors = {}
+            self.request_render()
+
     def set_surfaces(self, meshes: dict[int, Mesh], fragment_mode: bool = True) -> None:
         self.fragment_mode = fragment_mode
-        for actor in list(self.actors.values()) + list(self.baseline_actors.values()):
-            self.renderer.RemoveActor(actor)
-        self.actors.clear()
-        self.baseline_actors.clear()
+        cached = self._scene_cache.get(fragment_mode)
+        if cached is None or cached[0] is not meshes:
+            cached = (meshes, *self._make_actors(meshes, fragment_mode))
+            self._scene_cache[fragment_mode] = cached
+        scene_changed = self.actors is not cached[1]
+        if scene_changed:
+            for actor in list(self.actors.values()) + list(self.baseline_actors.values()):
+                self.renderer.RemoveActor(actor)
+            self.actors, self.baseline_actors = cached[1:]
+            for actor in list(self.actors.values()) + list(self.baseline_actors.values()):
+                self.renderer.AddActor(actor)
+        for label, actor in self.actors.items():
+            actor.SetVisibility(self.is_visible(label))
+            self.baseline_actors[label].SetVisibility(self._baseline and self.is_visible(label))
+        self.set_transforms(self.transforms)
+        if not self._camera_initialized and meshes:
+            self.profile_view()
+            self._camera_initialized = True
+        if self.document is not None:
+            selected = self.document.fragments if fragment_mode and self.document.fragments is not None else self.document.anatomy
+            if any(view.labels is not selected or view.fragment_mode != fragment_mode for view in self.slices):
+                self.refresh_slices()
+        if scene_changed:
+            self.request_render()
+
+    def _make_actors(
+        self, meshes: dict[int, Mesh], fragment_mode: bool
+    ) -> tuple[dict[int, vtkActor], dict[int, vtkActor]]:
+        actors: dict[int, vtkActor] = {}
+        baselines: dict[int, vtkActor] = {}
         colors = COLORS if fragment_mode else ANATOMY_COLORS
-        for label, (vertices, faces) in meshes.items():
+        for label, mesh in meshes.items():
             points = vtkPoints()
-            points.SetData(numpy_to_vtk(np.asarray(vertices, dtype=np.float32), deep=True))
+            points.SetData(numpy_to_vtk(mesh.vertices, deep=False))
             cells = vtkCellArray()
-            offsets = np.arange(0, len(faces) * 3 + 1, 3, dtype=np.int64)
-            connectivity = np.asarray(faces, dtype=np.int64).reshape(-1)
-            cells.SetData(numpy_to_vtkIdTypeArray(offsets, deep=True), numpy_to_vtkIdTypeArray(connectivity, deep=True))
+            cells.SetData(3, numpy_to_vtk(mesh.faces.reshape(-1), deep=False))
             poly = vtkPolyData()
             poly.SetPoints(points)
             poly.SetPolys(cells)
-            normals = vtkPolyDataNormals()
-            normals.SetInputData(poly)
-            normals.SplittingOff()
-            normals.ConsistencyOn()
+            poly.GetPointData().SetNormals(numpy_to_vtk(mesh.normals, deep=False))
             mapper = vtkPolyDataMapper()
-            mapper.SetInputConnection(normals.GetOutputPort())
+            mapper.SetInputData(poly)
             mapper.ScalarVisibilityOff()
             actor = vtkActor()
             actor.SetMapper(mapper)
             actor.GetProperty().SetColor(*colors.get(label, (0.8, 0.8, 0.8)))
             actor.GetProperty().SetInterpolationToPhong()
             actor.SetVisibility(self._visibility[fragment_mode].get(label, True))
-            self.actors[label] = actor
-            self.renderer.AddActor(actor)
+            actors[label] = actor
             baseline = vtkActor()
             baseline.SetMapper(mapper)
             baseline.GetProperty().SetColor(0.85, 0.85, 0.85)
@@ -714,32 +760,36 @@ class FourViews(QWidget):
             baseline.GetProperty().SetRepresentationToWireframe()
             baseline.PickableOff()
             baseline.SetVisibility(self._baseline and self._visibility[fragment_mode].get(label, True))
-            self.baseline_actors[label] = baseline
-            self.renderer.AddActor(baseline)
-        self.set_transforms(self.transforms)
-        if not self._camera_initialized and meshes:
-            self.profile_view()
-            self._camera_initialized = True
-        self.refresh_slices()
-        self.vtk.GetRenderWindow().Render()
+            baselines[label] = baseline
+        return actors, baselines
 
     def set_transforms(self, transforms: dict[int, np.ndarray]) -> None:
         self.transforms = transforms if self.fragment_mode else {}
+        changed = False
         for label, actor in self.actors.items():
             matrix = np.asarray(self.transforms.get(label, np.eye(4)))
+            existing = actor.GetUserMatrix()
+            if existing is not None and all(
+                existing.GetElement(row, column) == matrix[row, column]
+                for row in range(4)
+                for column in range(4)
+            ):
+                continue
             vtk_matrix = vtkMatrix4x4()
             for row in range(4):
                 for column in range(4):
                     vtk_matrix.SetElement(row, column, float(matrix[row, column]))
             actor.SetUserMatrix(vtk_matrix)
-        self.renderer.ResetCameraClippingRange()
-        self.vtk.GetRenderWindow().Render()
+            changed = True
+        if changed:
+            self.renderer.ResetCameraClippingRange()
+            self.request_render()
 
     def show_baseline(self, visible: bool) -> None:
         self._baseline = visible
         for label, actor in self.baseline_actors.items():
             actor.SetVisibility(visible and self._visibility[self.fragment_mode].get(label, True))
-        self.vtk.GetRenderWindow().Render()
+        self.request_render()
 
     def profile_view(self) -> None:
         if self.document is None:
@@ -759,7 +809,7 @@ class FourViews(QWidget):
         self.renderer.ResetCamera()
         self.renderer.ResetCameraClippingRange()
         self.view_label.setText("Right profile · anterior → · positive pitch: counterclockwise")
-        self.vtk.GetRenderWindow().Render()
+        self.request_render()
 
     def set_plane(self, origin_lps: Any, normal_lps: Any, enabled: bool = True) -> None:
         self._plane_updating = True
@@ -773,7 +823,7 @@ class FourViews(QWidget):
             view._plane = (origin, normal) if enabled else None
             view.update()
         self._plane_updating = False
-        self.vtk.GetRenderWindow().Render()
+        self.request_render()
 
     def _plane_changed(self, _caller: Any, _event: Any) -> None:
         if self._plane_updating:

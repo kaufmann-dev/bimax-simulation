@@ -11,7 +11,7 @@ import SimpleITK as sitk
 from scipy import ndimage as ndi
 from skimage.segmentation import watershed
 
-from bimax.model import Document, Geometry, Motion
+from bimax.model import FRAGMENTS, Document, Geometry, Motion
 
 Progress = Callable[[float, str], None] | None
 MEMORY_BUDGET = 16 * 1024**3
@@ -317,10 +317,97 @@ def _points_for_slab(doc: Document, start: int, stop: int) -> tuple[np.ndarray, 
                  for axis in range(3))
 
 
+def label_counts(labels: np.ndarray, maximum_label: int) -> np.ndarray:
+    """Count a validated label volume with bounded temporary allocations."""
+    counts = np.zeros(maximum_label + 1, dtype=np.int64)
+    flat = labels.reshape(-1)
+    for start in range(0, flat.size, 1_000_000):
+        counts += np.bincount(flat[start : start + 1_000_000], minlength=maximum_label + 1)
+    return counts
+
+
+def validate_fragment_preview(
+    doc: Document,
+    fragments: np.ndarray,
+    fragment_counts: np.ndarray,
+    anatomy_counts: np.ndarray,
+) -> None:
+    """Validate acceptance without rescanning or copying a previously built preview.
+
+    The caller must retain the counts returned with the worker's exact preview and
+    discard that preview whenever anatomy, frame, or cut geometry changes. Source
+    partition conservation was already checked by ``build_fragments``; only cached
+    counts and required confirmation voxels are examined here.
+    """
+    if (
+        not isinstance(fragments, np.ndarray)
+        or fragments.shape != doc.geometry.shape
+        or fragments.shape != doc.source.shape
+        or fragments.dtype != np.uint8
+    ):
+        raise ValueError("Fragment preview must be a uint8 volume matching the source geometry.")
+    for counts, length in ((fragment_counts, 9), (anatomy_counts, 5)):
+        if (
+            not isinstance(counts, np.ndarray)
+            or counts.shape != (length,)
+            or counts.dtype.kind not in "iu"
+            or np.any(counts < 0)
+            or np.any(counts > fragments.size)
+            or int(counts.sum()) != fragments.size
+        ):
+            raise ValueError("Fragment preview counts are invalid. Preview fragments again.")
+    if anatomy_counts[1]:
+        raise ValueError("Assign all bone to anatomy or explicitly exclude it before accepting cuts.")
+    ownership = np.array(
+        [fragment_counts[0], fragment_counts[8], fragment_counts[1:3].sum(),
+         fragment_counts[3:7].sum(), fragment_counts[7]],
+        dtype=np.int64,
+    )
+    if not np.array_equal(ownership, anatomy_counts):
+        raise ValueError("Fragment ownership does not match its anatomical parent; rebuild cuts.")
+    frame = np.asarray(doc.frame)
+    if (
+        frame.shape != (4, 4)
+        or not np.all(np.isfinite(frame))
+        or not np.allclose(frame[3], [0, 0, 0, 1])
+        or not np.allclose(frame[:3, :3].T @ frame[:3, :3], np.eye(3), atol=1e-6)
+        or not np.isclose(np.linalg.det(frame[:3, :3]), 1.0)
+    ):
+        raise ValueError("Planning frame must be a finite, right-handed rigid transform.")
+    geometry = doc.geometry
+    direction = np.asarray(geometry.direction).reshape(3, 3)
+    if (
+        not np.all(np.isfinite([*geometry.spacing, *geometry.origin, *geometry.direction]))
+        or min(geometry.spacing) <= 0
+        or not np.allclose(direction.T @ direction, np.eye(3), atol=1e-5)
+    ):
+        raise ValueError("The input has invalid physical geometry.")
+    required = set()
+    if doc.cuts.get("lefort", {}).get("enabled", False):
+        required.add(2)
+    if doc.cuts.get("bsso", {}).get("enabled", False):
+        required.update((3, 4, 5))
+    if doc.cuts.get("genio", {}).get("enabled", False):
+        required.update((5, 6))
+    for label in sorted(required):
+        if not fragment_counts[label]:
+            raise ValueError(f"The cuts leave {FRAGMENTS[label]} empty. Adjust the cut geometry.")
+        confirmation = doc.confirmations.get(str(label))
+        if confirmation is None:
+            raise ValueError(f"Place a confirmation point inside {FRAGMENTS[label]} before accepting cuts.")
+        point = _vector(confirmation, "Fragment confirmation")
+        xyz = np.rint(doc.geometry.world_to_index(doc.plan_to_world(point)))
+        zyx = xyz[::-1]
+        if (not np.all(np.isfinite(zyx)) or np.any(zyx < 0) or np.any(zyx >= fragments.shape)
+                or fragments[tuple(zyx.astype(int))] != label):
+            raise ValueError(f"The confirmation point for {FRAGMENTS[label]} is outside its fragment.")
+
+
 def build_fragments(doc: Document, validate: bool = True, progress: Progress = None) -> np.ndarray:
     """Partition approved anatomy using zero-thickness baseline-space cuts."""
     assert_partition(doc.source, doc.anatomy, maximum_label=4)
-    if validate and any(np.any(slab == 1) for slab in doc.anatomy):
+    counts = label_counts(doc.anatomy, 4) if validate else None
+    if counts is not None and counts[1]:
         raise ValueError("Assign all bone to anatomy or explicitly exclude it before accepting cuts.")
     _check_memory(doc, doc.source.size, bytes_per_voxel=3)
     fragments = np.array([0, 8, 1, 5, 7], dtype=np.uint8)[doc.anatomy]
@@ -352,27 +439,8 @@ def build_fragments(doc: Document, validate: bool = True, progress: Progress = N
             _report(progress, stop / doc.source.shape[0] * 0.9, "Partitioning bone fragments")
     assert_partition(doc.source, fragments)
     if validate:
-        required = set()
-        if lefort["enabled"]:
-            required.add(2)
-        if bsso["enabled"]:
-            required.update((3, 4, 5))
-        if genio["enabled"]:
-            required.update((5, 6))
-        from bimax.model import FRAGMENTS
-
-        for label in sorted(required):
-            if not np.any(fragments == label):
-                raise ValueError(f"The cuts leave {FRAGMENTS[label]} empty. Adjust the cut geometry.")
-            confirmation = doc.confirmations.get(str(label))
-            if confirmation is None:
-                raise ValueError(f"Place a confirmation point inside {FRAGMENTS[label]} before accepting cuts.")
-            point = _vector(confirmation, "Fragment confirmation")
-            xyz = np.rint(doc.geometry.world_to_index(doc.plan_to_world(point))).astype(int)
-            zyx = xyz[::-1]
-            if (np.any(zyx < 0) or np.any(zyx >= fragments.shape)
-                    or fragments[tuple(zyx)] != label):
-                raise ValueError(f"The confirmation point for {FRAGMENTS[label]} is outside its fragment.")
+        assert counts is not None
+        validate_fragment_preview(doc, fragments, label_counts(fragments, 8), counts)
     _report(progress, 1.0, "Fragment preview ready")
     return fragments
 
