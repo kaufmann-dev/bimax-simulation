@@ -1,0 +1,2 @@
+"""BIMAX binary-volume simulation."""
+
