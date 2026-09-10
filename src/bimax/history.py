@@ -47,11 +47,21 @@ class History:
             # Labelmap replacement is O(1). Later sparse edits are undone first,
             # restoring these arrays before history crosses the replacement.
             setattr(doc, field, value if field == "anatomy" else deepcopy(value))
-        if edit.patches or any(field in edit.before for field in ("anatomy", "cuts", "frame")):
-            doc.fragments = None
-            doc.confirmations = {}
         if doc.active_scenario not in doc.scenarios:
             doc.active_scenario = next(iter(doc.scenarios))
+        anatomy_changed = (
+            any(patch[0] == "anatomy" for patch in edit.patches)
+            or "anatomy" in edit.before
+            or "frame" in edit.before
+        )
+        if anatomy_changed:
+            doc.anatomy_revision += 1
+            for plan in doc.plans.values():
+                plan.accepted = False
+                plan.confirmations = {}
+        if anatomy_changed or doc.fragments_key != doc.configuration_key or not doc.plan.accepted:
+            doc.fragments = None
+            doc.fragments_key = None
         doc.revision += 1
         destination.append(edit)
         return True

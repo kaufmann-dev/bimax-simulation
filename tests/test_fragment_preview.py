@@ -21,10 +21,11 @@ def preview():
         np.zeros_like(source),
         frame=np.eye(4),
     )
-    doc.cuts = {
+    doc.plan.cuts = {
         "lefort": {
             "enabled": True,
-            "plane": {"origin": [0, 0, 8], "normal": [0, 0, -1]},
+            "planes": {"upper": {"origin": [0, 0, 8], "normal": [0, 0, -1]}},
+            "groups": [["upper"]],
             "region": {"min": [-100, -100, -100], "max": [100, 100, 100]},
         },
         "bsso": {
@@ -45,7 +46,7 @@ def preview():
     fragments = build_fragments(doc, validate=False)
     for label in (2, 3, 4, 5):
         xyz = np.argwhere(fragments == label)[0][::-1]
-        doc.confirmations[str(label)] = doc.world_to_plan(doc.geometry.index_to_world(xyz)).tolist()
+        doc.plan.confirmations[str(label)] = doc.world_to_plan(doc.geometry.index_to_world(xyz)).tolist()
     return doc, fragments, label_counts(fragments, 8), label_counts(anatomy, 4)
 
 
@@ -82,7 +83,7 @@ def test_acceptance_checks_only_cached_counts_and_confirmation_samples(preview, 
 
 def test_acceptance_reports_missing_confirmation(preview):
     doc, *args = preview
-    del doc.confirmations["2"]
+    del doc.plan.confirmations["2"]
     with pytest.raises(ValueError, match="Place a confirmation point inside Maxilla"):
         validate_fragment_preview(doc, *args)
 
@@ -90,7 +91,7 @@ def test_acceptance_reports_missing_confirmation(preview):
 @pytest.mark.parametrize("point", [[1, 2, 3], [-100, 0, 0], [1e30, 0, 0]])
 def test_acceptance_reports_wrong_or_outside_confirmation(preview, point):
     doc, *args = preview
-    doc.confirmations["2"] = point
+    doc.plan.confirmations["2"] = point
     with pytest.raises(ValueError, match="confirmation point for Maxilla is outside"):
         validate_fragment_preview(doc, *args)
 
@@ -98,7 +99,7 @@ def test_acceptance_reports_wrong_or_outside_confirmation(preview, point):
 @pytest.mark.parametrize("point", [[float("nan"), 0, 0], [0, float("inf"), 0], [1, 2]])
 def test_acceptance_rejects_nonfinite_or_invalid_confirmation(preview, point):
     doc, *args = preview
-    doc.confirmations["2"] = point
+    doc.plan.confirmations["2"] = point
     with pytest.raises(ValueError, match="Fragment confirmation must contain three finite"):
         validate_fragment_preview(doc, *args)
 
@@ -158,7 +159,7 @@ def test_acceptance_rejects_invalid_coordinate_transforms(preview, invalid):
 
 def test_cached_acceptance_matches_full_build_without_mutating_preview(preview):
     doc, fragments, counts, anatomy_count = preview
-    before = deepcopy(doc.confirmations)
+    before = deepcopy(doc.plan.confirmations)
     validate_fragment_preview(doc, fragments, counts, anatomy_count)
     np.testing.assert_array_equal(build_fragments(doc), fragments)
-    assert doc.confirmations == before
+    assert doc.plan.confirmations == before

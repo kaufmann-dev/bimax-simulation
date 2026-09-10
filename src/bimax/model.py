@@ -60,8 +60,30 @@ class Motion:
     pivot_set: bool = False
 
 
-def new_scenario() -> dict[str, Motion]:
+def new_motions() -> dict[str, Motion]:
     return {key: Motion() for key in ("linked", "maxilla", "mandible", "chin")}
+
+
+@dataclass
+class CutPlan:
+    name: str
+    lefort_level: int = 1
+    # All cut coordinates and confirmation points are in baseline planning mm.
+    cuts: dict[str, Any] = field(default_factory=dict)
+    confirmations: dict[str, list[float]] = field(default_factory=dict)
+    accepted: bool = False
+    revision: int = 0
+
+
+@dataclass
+class Scenario:
+    plan_id: str = "plan1"
+    motions: dict[str, Motion] = field(default_factory=new_motions)
+    landmarks: list[dict[str, Any]] = field(default_factory=list)
+
+
+def new_scenario(plan_id: str = "plan1") -> Scenario:
+    return Scenario(plan_id=plan_id)
 
 
 @dataclass
@@ -71,18 +93,17 @@ class Document:
     anatomy: np.ndarray
     seeds: np.ndarray
     barriers: np.ndarray
+    # Derived active-plan geometry only; not a second persisted source of truth.
     fragments: np.ndarray | None = None
+    fragments_key: tuple[str, int, int] | None = None
     # Maps LPS world points into the planning frame (Right, Anterior, Superior).
     frame: np.ndarray = field(default_factory=lambda: np.diag([-1.0, -1.0, 1.0, 1.0]))
-    # Cut dictionaries contain enabled, planes {origin, normal}, regions {min, max}; all in planning mm.
-    cuts: dict[str, Any] = field(default_factory=dict)
-    # Confirmation points keyed by fragment ID string, in planning mm.
-    confirmations: dict[str, list[float]] = field(default_factory=dict)
-    scenarios: dict[str, dict[str, Motion]] = field(
+    plans: dict[str, CutPlan] = field(default_factory=lambda: {"plan1": CutPlan("Le Fort I")})
+    scenarios: dict[str, Scenario] = field(
         default_factory=lambda: {"Scenario 1": new_scenario()}
     )
     active_scenario: str = "Scenario 1"
-    landmarks: list[dict[str, Any]] = field(default_factory=list)
+    anatomy_revision: int = 0
     source_name: str = ""
     revision: int = 0
 
@@ -95,4 +116,22 @@ class Document:
 
     @property
     def motions(self) -> dict[str, Motion]:
+        return self.scenario.motions
+
+    @property
+    def scenario(self) -> Scenario:
         return self.scenarios[self.active_scenario]
+
+    @property
+    def plan(self) -> CutPlan:
+        return self.plans[self.scenario.plan_id]
+
+    @property
+    def configuration_key(self) -> tuple[str, int, int]:
+        return self.scenario.plan_id, self.plan.revision, self.anatomy_revision
+
+    @property
+    def fragment_names(self) -> dict[int, str]:
+        names = dict(FRAGMENTS)
+        names[2] = {1: "Maxilla", 2: "Central midface", 3: "Midface"}[self.plan.lefort_level]
+        return names

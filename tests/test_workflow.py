@@ -15,10 +15,10 @@ from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QFileDialog, QInputDialog, QMessageBox
 
 from bimax.app import MainWindow
-from bimax.engine import default_cuts
+from bimax.engine import build_fragments, default_cuts, required_fragment_labels
 from bimax.history import Edit, History
 from bimax.jobs import Jobs
-from bimax.model import Document, Geometry, new_scenario
+from bimax.model import CutPlan, Document, Geometry, new_scenario
 from bimax.storage import load_project, save_project
 from bimax.surfaces import make_surfaces
 
@@ -80,9 +80,11 @@ def synthetic_document(assigned=False, fragments=False):
         np.zeros_like(source),
         source_name="synthetic-bone.nii.gz",
     )
-    doc.cuts = default_cuts(doc)
+    doc.plan.cuts = default_cuts(doc)
     if fragments:
         doc.fragments = np.array([0, 8, 1, 5, 7], dtype=np.uint8)[anatomy]
+        doc.plan.accepted = True
+        doc.fragments_key = doc.configuration_key
     return doc
 
 
@@ -101,6 +103,191 @@ def install_document(window, doc):
             "fragment_mode": doc.fragments is not None,
         },
     )
+
+
+def alternative_document():
+    doc = synthetic_document(assigned=True)
+    doc.plans = {}
+    doc.scenarios = {}
+    for level, genio in ((1, False), (2, True), (3, False)):
+        name = f"Le Fort {level}"
+        plan_id = f"lf{level}"
+        cuts = default_cuts(doc, level)
+        cuts["lefort"]["enabled"] = True
+        if level == 1:
+            cuts["lefort"]["planes"]["upper"]["origin"][2] = 18
+        cuts["genio"]["enabled"] = genio
+        doc.plans[plan_id] = CutPlan(name, lefort_level=level, cuts=cuts)
+        doc.scenarios[name] = new_scenario(plan_id)
+        doc.active_scenario = name
+        labels = build_fragments(doc, validate=False)
+        for label in required_fragment_labels(doc.plan):
+            zyx = np.argwhere(labels == label)[0]
+            doc.plan.confirmations[str(label)] = doc.world_to_plan(
+                doc.geometry.index_to_world(zyx[::-1])
+            ).tolist()
+        build_fragments(doc, validate=True)
+        doc.plan.accepted = True
+    doc.active_scenario = "Le Fort 1"
+    doc.fragments = build_fragments(doc)
+    doc.fragments_key = doc.configuration_key
+    return doc
+
+
+def test_switching_operation_scenarios_is_lazy_cached_and_keeps_independent_motion(
+    window, monkeypatch
+):
+    from bimax.worker import execute
+
+    doc = alternative_document()
+    install_document(window, doc)
+    first_labels = doc.fragments
+    requests = []
+    monkeypatch.setattr(
+        window.jobs, "submit", lambda operation, *args, **options: requests.append(operation)
+    )
+    window.motion_spins[1].setValue(7)
+    window._finish_motion_edit()
+    window.scenario_combo.setCurrentText("Le Fort 2")
+    assert requests == ["prepare_plan"]
+    assert doc.fragments is None
+    assert not window.motion_spins[1].isEnabled()
+    assert window.cut_scenario_combo.currentText() == "Le Fort 2"
+    result = execute("prepare_plan", doc, {})
+    window._job_finished("prepare_plan", doc.revision, result)
+    assert doc.fragments_key == doc.configuration_key
+    assert 6 in window.views.actors
+    assert (
+        window.motion_combo.itemText(window.motion_combo.findData("maxilla")) == "Central midface"
+    )
+    window.motion_spins[1].setValue(3)
+    window._finish_motion_edit()
+    window.cut_scenario_combo.setCurrentText("Le Fort 1")
+    assert requests == ["prepare_plan"]
+    assert doc.fragments is first_labels
+    assert doc.motions["linked"].translation[1] == 7
+    assert doc.scenarios["Le Fort 2"].motions["linked"].translation[1] == 3
+    assert 6 not in window.views.actors
+    chin = window.motion_combo.model().item(window.motion_combo.findData("chin"))
+    assert not chin.isEnabled()
+    window.move_plan_combo.setCurrentIndex(window.move_plan_combo.findData("lf2"))
+    assert doc.scenario.plan_id == "lf2"
+    assert requests == ["prepare_plan"]
+    window._undo(False)
+    assert doc.scenario.plan_id == "lf1"
+    assert doc.fragments is first_labels
+    assert requests == ["prepare_plan"]
+    assert len(window._plan_cache) == 2
+
+
+def test_plan_edit_invalidates_only_linked_geometry_and_landmarks_and_undo_restores(
+    window, monkeypatch
+):
+    from bimax.worker import execute
+
+    doc = alternative_document()
+    point = doc.plan.confirmations["2"]
+    doc.scenario.landmarks = [{"name": "A", "point": point, "fragment": 2}]
+    doc.scenarios["Linked alternative"] = deepcopy(doc.scenario)
+    doc.scenarios["Le Fort 2"].landmarks = [
+        {"name": "B", "point": doc.plans["lf2"].confirmations["2"], "fragment": 2}
+    ]
+    original = deepcopy(doc.plans)
+    install_document(window, doc)
+    requests = []
+    monkeypatch.setattr(
+        window.jobs, "submit", lambda operation, *args, **options: requests.append(operation)
+    )
+    window.tabs.setCurrentIndex(2)
+    window.plane_origin[2].setValue(19)
+    window.plane_origin[2].editingFinished.emit()
+    assert not doc.plan.accepted
+    assert doc.fragments is None
+    assert doc.scenario.landmarks == doc.scenarios["Linked alternative"].landmarks == []
+    assert doc.plans["lf2"] == original["lf2"]
+    assert doc.plans["lf3"] == original["lf3"]
+    assert doc.scenarios["Le Fort 2"].landmarks
+    window._undo(False)
+    assert doc.plan == original["lf1"]
+    assert doc.scenario.landmarks
+    assert requests == ["prepare_plan"]
+    window._job_finished("prepare_plan", doc.revision, execute("prepare_plan", doc, {}))
+    assert doc.fragments_key == doc.configuration_key
+
+
+def test_plan_creation_adds_independent_plan_and_scenario_without_overwriting_original(
+    window, monkeypatch
+):
+    from bimax.worker import execute
+
+    doc = alternative_document()
+    install_document(window, doc)
+    original = deepcopy(doc.plans)
+    requests = []
+    monkeypatch.setattr(QInputDialog, "getItem", lambda *args: ("Le Fort III", True))
+    monkeypatch.setattr(QInputDialog, "getText", lambda *args, **kwargs: ("New LF III", True))
+    monkeypatch.setattr(
+        window.jobs,
+        "submit",
+        lambda operation, document, **options: requests.append((operation, options)),
+    )
+    window._create_plan()
+    operation, options = requests.pop()
+    assert operation == "create_plan"
+    window._job_finished(operation, doc.revision, execute(operation, doc, options))
+    assert doc.active_scenario == "New LF III"
+    assert doc.plan.lefort_level == 3
+    assert not doc.plan.accepted
+    assert len(doc.plans) == 4
+    assert doc.fragments is None
+    for key, value in original.items():
+        assert doc.plans[key] == value
+    assert doc.plan.cuts["bsso"] is not doc.plans["lf1"].cuts["bsso"]
+    assert not requests
+
+
+def test_different_plan_result_and_pending_preview_cannot_be_accepted(window, monkeypatch):
+    from bimax.worker import execute
+
+    doc = alternative_document()
+    install_document(window, doc)
+    old_result = execute("cuts_preview", doc, {})
+    monkeypatch.setattr(window.jobs, "submit", lambda *args, **kwargs: None)
+    window.scenario_combo.setCurrentText("Le Fort 2")
+    window._job_finished("cuts_preview", doc.revision, old_result)
+    assert window.pending_fragments is None
+    assert "different cut plan" in window.statusBar().currentMessage()
+    window.pending_fragments = old_result["fragments"]
+    window._fragment_counts = old_result["fragment_counts"]
+    window._pending_key = old_result["configuration_key"]
+    window._build_cuts(True)
+    assert doc.fragments is None
+
+
+@pytest.mark.parametrize("field,value", [("seeds", 3), ("barriers", 1)])
+def test_separation_hint_edits_and_undo_preserve_all_accepted_plans(
+    window, monkeypatch, field, value
+):
+    doc = alternative_document()
+    install_document(window, doc)
+    plans = deepcopy(doc.plans)
+    labels = doc.fragments
+    key = doc.configuration_key
+    window.tabs.setCurrentIndex(1)
+    monkeypatch.setattr(
+        window.jobs, "submit", lambda *args, **kwargs: pytest.fail("Hints must not rebuild cuts")
+    )
+    indices = np.array([np.ravel_multi_index((5, 5, 5), doc.geometry.shape)])
+    window._apply_array_edit("Edit hint", field, indices, value)
+    assert doc.plans == plans
+    assert doc.fragments is labels
+    assert doc.configuration_key == key
+    window._undo(False)
+    assert doc.plans == plans
+    assert doc.fragments is labels
+    window._undo(True)
+    assert doc.plans == plans
+    assert doc.fragments is labels
 
 
 def test_cached_stage_changes_and_movement_undo_do_not_submit_jobs(window, monkeypatch):
@@ -176,14 +363,14 @@ def test_cut_acceptance_reuses_preview_and_cut_edit_discards_actors(window, monk
     from bimax.worker import execute
 
     doc = synthetic_document(assigned=True)
-    doc.cuts["lefort"]["enabled"] = True
-    doc.cuts["lefort"]["plane"]["origin"][2] = 18
+    doc.plan.cuts["lefort"]["enabled"] = True
+    doc.plan.cuts["lefort"]["planes"]["upper"]["origin"][2] = 18
     install_document(window, doc)
     window.tabs.setCurrentIndex(2)
     result = execute("cuts_preview", doc, {})
     window._job_finished("cuts_preview", doc.revision, result)
     xyz = np.argwhere(result["fragments"] == 2)[0][::-1]
-    doc.confirmations["2"] = doc.world_to_plan(doc.geometry.index_to_world(xyz)).tolist()
+    doc.plan.confirmations["2"] = doc.world_to_plan(doc.geometry.index_to_world(xyz)).tolist()
     actor = window.views.actors[2]
     monkeypatch.setattr(
         window.jobs, "submit", lambda *args, **kwargs: pytest.fail("accept must reuse preview")
@@ -304,7 +491,7 @@ def test_native_import_separate_cut_move_save_reopen_export(window, qapp, tmp_pa
         window.confirm_combo.setCurrentIndex(window.confirm_combo.findData(label))
         window._arm_pick("confirm")
         window.views.pointPicked.emit(point.tolist())
-        assert str(label) in window.doc.confirmations
+        assert str(label) in window.doc.plan.confirmations
     window.accept_cuts_button.click()
     wait_until(qapp, lambda: not window.jobs.busy)
     assert window._test_errors == []
@@ -377,7 +564,7 @@ def test_reset_pivot_preserves_translation_other_controls_and_saved_state(window
     other = doc.motions["maxilla"]
     other.translation, other.angles = [1.0, 4.0, 0.0], [3.0, 0.0, 0.0]
     other.pivot, other.pivot_set = [-9.0, -8.0, 15.0], True
-    doc.scenarios["Alternative"] = deepcopy(doc.motions)
+    doc.scenarios["Alternative"] = deepcopy(doc.scenario)
     before = deepcopy(doc.scenarios)
     accepted = doc.fragments.copy()
     install_document(window, doc)
@@ -393,7 +580,7 @@ def test_reset_pivot_preserves_translation_other_controls_and_saved_state(window
     assert not selected.pivot_set
     assert doc.scenarios["Alternative"] == before["Alternative"]
     for key in ("linked", "maxilla", "chin"):
-        assert doc.motions[key] == before["Scenario 1"][key]
+        assert doc.motions[key] == before["Scenario 1"].motions[key]
     np.testing.assert_array_equal(doc.fragments, accepted)
     assert window.dirty
     assert [edit.name for edit in window.history.undo_stack] == ["Reset pivot"]
@@ -413,7 +600,8 @@ def test_reset_pivot_preserves_translation_other_controls_and_saved_state(window
     save_project(doc, project)
     saved = load_project(project)
     assert saved.scenarios == after
-    np.testing.assert_array_equal(saved.fragments, accepted)
+    assert saved.fragments is None
+    np.testing.assert_array_equal(build_fragments(saved), accepted)
 
     window._undo(False)
     wait_until(qapp, lambda: not window.jobs.busy)
@@ -543,12 +731,12 @@ def test_boundary_confirmation_snaps_only_for_3d_surface_pick(window, surface_pi
     if surface_pick:
         window.views.last_pick_fragment = 5
         window.views.pointPicked.emit(point.tolist())
-        assert "5" in doc.confirmations
-        voxel_center = doc.plan_to_world(doc.confirmations["5"])
+        assert "5" in doc.plan.confirmations
+        voxel_center = doc.plan_to_world(doc.plan.confirmations["5"])
         np.testing.assert_allclose(voxel_center, [3, 8, 5])
     else:
         window.views._point_picked(point.tolist())
-        assert doc.confirmations == {}
+        assert doc.plan.confirmations == {}
 
 
 @pytest.mark.parametrize("surface_pick", [False, True])
@@ -564,12 +752,12 @@ def test_boundary_landmark_preserves_surface_point_without_assigning_background(
         window.selected_fragment = 1
         window.views.last_pick_fragment = 5
         window.views.pointPicked.emit(point.tolist())
-        assert len(doc.landmarks) == 1
-        assert doc.landmarks[0]["fragment"] == 5
-        np.testing.assert_allclose(doc.plan_to_world(doc.landmarks[0]["point"]), point)
+        assert len(doc.scenario.landmarks) == 1
+        assert doc.scenario.landmarks[0]["fragment"] == 5
+        np.testing.assert_allclose(doc.plan_to_world(doc.scenario.landmarks[0]["point"]), point)
     else:
         window.views._point_picked(point.tolist())
-        assert doc.landmarks == []
+        assert doc.scenario.landmarks == []
 
 
 def test_surface_confirmation_does_not_snap_to_a_different_fragment(window):
@@ -581,12 +769,13 @@ def test_surface_confirmation_does_not_snap_to_a_different_fragment(window):
     window._arm_pick("confirm")
     window.views.last_pick_fragment = 1
     window.views.pointPicked.emit([2.49, 8.0, 5.0])
-    assert doc.confirmations == {}
+    assert doc.plan.confirmations == {}
 
 
 def test_frame_undo_and_duplicate_scenario_remain_valid(window, qapp, monkeypatch):
     doc = synthetic_document(assigned=True, fragments=True)
     install_document(window, doc)
+    monkeypatch.setattr(QMessageBox, "question", lambda *args: QMessageBox.StandardButton.Yes)
     original_frame = doc.frame.copy()
     window.frame_spins[0].setValue(12)
     window.frame_spins[0].editingFinished.emit()

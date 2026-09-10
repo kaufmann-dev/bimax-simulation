@@ -7,7 +7,7 @@ import pytest
 import SimpleITK as sitk
 
 from bimax import engine
-from bimax.model import Document, Geometry, Motion
+from bimax.model import CutPlan, Document, Geometry, Motion, new_scenario
 
 
 def document(source=None, *, spacing=(1.0, 1.0, 1.0), frame=None):
@@ -20,7 +20,7 @@ def document(source=None, *, spacing=(1.0, 1.0, 1.0), frame=None):
     )
     if frame is not None:
         result.frame = np.asarray(frame, dtype=float)
-    result.cuts = engine.default_cuts(result)
+    result.plan.cuts = engine.default_cuts(result)
     return result
 
 
@@ -31,6 +31,15 @@ def plane(origin, normal):
 def bounded(origin, normal, minimum=(-100, -100, -100), maximum=(100, 100, 100)):
     return {"enabled": True, "plane": plane(origin, normal),
             "region": {"min": minimum, "max": maximum}}
+
+
+def upper_cut(origin, normal, minimum=(-100, -100, -100), maximum=(100, 100, 100)):
+    return {
+        "enabled": True,
+        "planes": {"upper": plane(origin, normal)},
+        "groups": [["upper"]],
+        "region": {"min": minimum, "max": maximum},
+    }
 
 
 def test_load_preserves_anisotropic_oblique_reflected_geometry(tmp_path):
@@ -148,7 +157,7 @@ def test_lefort_plane_and_box_use_physical_geometry_and_preserve_partition():
     angle = np.deg2rad(30)
     doc.geometry.direction = tuple(np.array([[-np.cos(angle), -np.sin(angle), 0],
                                              [-np.sin(angle), np.cos(angle), 0], [0, 0, 1]]).ravel())
-    doc.cuts["lefort"] = bounded([0, 0, 3], [0, 0, -1], [-3, -2, -1], [0, 10, 20])
+    doc.plan.cuts["lefort"] = upper_cut([0, 0, 3], [0, 0, -1], [-3, -2, -1], [0, 10, 20])
     fragments = engine.build_fragments(doc, validate=False)
     z, y, x = np.indices(doc.source.shape)
     xyz = np.stack((x, y, z), axis=-1)
@@ -160,14 +169,14 @@ def test_lefort_plane_and_box_use_physical_geometry_and_preserve_partition():
     with pytest.raises(ValueError, match="confirmation point"):
         engine.build_fragments(doc)
     zyx = np.argwhere(fragments == 2)[0]
-    doc.confirmations["2"] = doc.geometry.index_to_world(zyx[::-1]).tolist()
+    doc.plan.confirmations["2"] = doc.geometry.index_to_world(zyx[::-1]).tolist()
     np.testing.assert_array_equal(engine.build_fragments(doc), fragments)
 
 
 def test_bsso_and_genioplasty_own_expected_sides_and_require_valid_seeds():
     doc = document(frame=np.eye(4))
     doc.anatomy.fill(3)
-    doc.cuts["bsso"] = {
+    doc.plan.cuts["bsso"] = {
         "enabled": True, "midline": 4,
         "left": {"front": plane([0, 4, 0], [0, -1, 0]),
                  "upper": plane([0, 0, 6], [0, 0, 1]),
@@ -176,7 +185,7 @@ def test_bsso_and_genioplasty_own_expected_sides_and_require_valid_seeds():
                   "upper": plane([0, 0, 6], [0, 0, 1]),
                   "sagittal": plane([7, 0, 0], [1, 0, 0])},
     }
-    doc.cuts["genio"] = bounded([0, 0, 1], [0, 0, -1], [0, 5, 0], [8, 8, 8])
+    doc.plan.cuts["genio"] = bounded([0, 0, 1], [0, 0, -1], [0, 5, 0], [8, 8, 8])
     fragments = engine.build_fragments(doc, validate=False)
     assert fragments[3, 2, 0] == 3
     assert fragments[7, 2, 3] == 3
@@ -187,15 +196,15 @@ def test_bsso_and_genioplasty_own_expected_sides_and_require_valid_seeds():
     assert fragments[0, 2, 4] == 5
     assert set(np.unique(fragments)) == {3, 4, 5, 6}
     engine.assert_partition(doc.source, fragments)
-    doc.confirmations = {"3": [0, 2, 3], "4": [8, 2, 3], "5": [4, 7, 3], "6": [4, 7, 0]}
+    doc.plan.confirmations = {"3": [0, 2, 3], "4": [8, 2, 3], "5": [4, 7, 3], "6": [4, 7, 0]}
     np.testing.assert_array_equal(engine.build_fragments(doc), fragments)
-    doc.confirmations["4"] = [0, 2, 3]
+    doc.plan.confirmations["4"] = [0, 2, 3]
     with pytest.raises(ValueError, match="Right proximal.*outside"):
         engine.build_fragments(doc)
     # One side changes independently, without touching the opposite fragment.
-    changed = deepcopy(doc.cuts)
+    changed = deepcopy(doc.plan.cuts)
     changed["bsso"]["left"]["front"]["origin"][1] = 1
-    doc.cuts = changed
+    doc.plan.cuts = changed
     result = engine.build_fragments(doc, validate=False)
     np.testing.assert_array_equal(result[:, :, 4:], fragments[:, :, 4:])
     assert result[3, 2, 0] == 5
@@ -240,6 +249,8 @@ def test_rotation_requires_an_explicit_pivot_but_translation_does_not():
 
 def test_fragment_hierarchy_inherits_mandible_once_in_lps():
     doc = document()
+    doc.plan.cuts["lefort"]["enabled"] = True
+    doc.plan.cuts["genio"]["enabled"] = True
     doc.motions["linked"].translation = [0, 10, 0]
     doc.motions["maxilla"].translation = [0, 3, -4]
     doc.motions["mandible"].translation = [0, 5, 0]
@@ -254,3 +265,196 @@ def test_fragment_hierarchy_inherits_mandible_once_in_lps():
     again = engine.fragment_transforms(doc)
     for label in transforms:
         np.testing.assert_array_equal(again[label], transforms[label])
+
+
+@pytest.mark.parametrize("key, operation, label", [("chin", "genio", 6), ("maxilla", "lefort", 2)])
+def test_disabled_operations_ignore_retained_invalid_motion(key, operation, label):
+    doc = document()
+    doc.motions[key].angles = [15, 0, 0]
+    doc.motions[key].pivot_set = False
+    doc.motions["linked"].translation = [0, 3, 0]
+    doc.motions["mandible"].translation = [0, 2, 0]
+    transforms = engine.fragment_transforms(doc)
+    np.testing.assert_array_equal(transforms[label], np.eye(4))
+    np.testing.assert_array_equal(transforms[5][:3, 3], [0, -5, 0])
+    assert doc.motions[key].angles == [15, 0, 0], "Omitting an operation preserves scenario parameters"
+    doc.plan.cuts[operation]["enabled"] = True
+    with pytest.raises(ValueError, match="visible rotation pivot"):
+        engine.fragment_transforms(doc)
+
+
+def test_plans_and_scenarios_isolate_small_state_and_share_baseline_arrays():
+    doc = document()
+    baseline = (doc.source, doc.anatomy, doc.seeds, doc.barriers)
+    doc.plans["lf3"] = CutPlan("Le Fort III", 3, engine.default_cuts(doc, 3))
+    doc.scenarios["LF III"] = new_scenario("lf3")
+    doc.motions["linked"].translation[1] = 4
+    doc.scenario.landmarks.append({"name": "A", "point": [0, 0, 0], "fragment": 2})
+    doc.plan.confirmations["2"] = [1, 1, 1]
+    first_key = doc.configuration_key
+    doc.active_scenario = "LF III"
+    assert doc.motions["linked"].translation == [0, 0, 0]
+    assert doc.scenario.landmarks == []
+    assert doc.plan.confirmations == {}
+    assert doc.fragment_names[2] == "Midface"
+    assert doc.configuration_key != first_key
+    for actual, original in zip((doc.source, doc.anatomy, doc.seeds, doc.barriers), baseline, strict=True):
+        assert actual is original
+    key = doc.configuration_key
+    doc.motions["maxilla"].translation[1] = 3
+    doc.revision += 1
+    assert doc.configuration_key == key
+    doc.plan.revision += 1
+    assert doc.configuration_key != key
+
+
+def test_templates_have_distinct_central_and_lateral_envelopes():
+    doc = document(np.ones((21, 21, 21), dtype=np.uint8), frame=np.eye(4))
+    doc.anatomy.fill(2)
+    # Centre, orbital-floor valley, lateral wing at the same height.
+    points = [[10, 19, 12], [15, 19, 12], [19, 19, 12]]
+    for level, expected in ((1, [1, 1, 1]), (2, [2, 1, 1]), (3, [2, 1, 2])):
+        plan = CutPlan(f"Le Fort {level}", level, engine.default_cuts(doc, level))
+        plan.cuts["lefort"]["enabled"] = True
+        np.testing.assert_array_equal(engine.fragment_labels_at_points(doc, points, plan), expected)
+        assert not plan.cuts["bsso"]["enabled"]
+        assert not plan.cuts["genio"]["enabled"]
+    # The LF III valley lies between two selected points: the envelope is
+    # deliberately nonconvex, unlike a single plane or one convex intersection.
+
+
+@pytest.mark.parametrize("level", [1, 2, 3])
+@pytest.mark.parametrize("genio", [False, True])
+def test_all_operation_variants_conserve_bone_and_match_exact_point_predicates(level, genio):
+    doc = document(np.ones((21, 21, 21), dtype=np.uint8))
+    doc.anatomy[:9] = 3
+    doc.anatomy[9:] = 2
+    # Raise the LF I template enough to intersect this synthetic upper jaw.
+    doc.plan.lefort_level = level
+    doc.plan.cuts = engine.default_cuts(doc, level)
+    if level == 1:
+        doc.plan.cuts["lefort"]["planes"]["upper"]["origin"][2] = 11
+    doc.plan.cuts["lefort"]["enabled"] = True
+    doc.plan.cuts["bsso"]["enabled"] = True
+    doc.plan.cuts["genio"]["enabled"] = genio
+    fragments = engine.build_fragments(doc, validate=False)
+    np.testing.assert_array_equal(fragments != 0, doc.source != 0)
+    np.testing.assert_array_equal(np.array([0, 2, 2, 3, 3, 3, 3, 4, 1])[fragments], doc.anatomy)
+    assert bool(np.any(fragments == 6)) == genio
+    required = {2, 3, 4, 5} | ({6} if genio else set())
+    assert engine.required_fragment_labels(doc.plan) == required
+    for label in required:
+        xyz = np.argwhere(fragments == label)[0][::-1]
+        doc.plan.confirmations[str(label)] = doc.world_to_plan(doc.geometry.index_to_world(xyz)).tolist()
+    np.testing.assert_array_equal(engine.build_fragments(doc), fragments)
+    xyz = np.indices(doc.source.shape).reshape(3, -1)[::-1].T
+    points = doc.world_to_plan(doc.geometry.index_to_world(xyz))
+    np.testing.assert_array_equal(engine.fragment_labels_at_points(doc, points), fragments.ravel())
+
+
+def test_point_membership_rounds_to_voxel_centres_and_handles_outside():
+    doc = document(frame=np.eye(4), spacing=(0.4, 0.7, 1.2))
+    doc.anatomy.fill(2)
+    doc.plan.cuts["lefort"] = upper_cut([0, 0, 3], [0, 0, -1])
+    points = [[0, 0, 2.99], [0, 0, 3.01], [-100, 0, 0], [1e30, 0, 0]]
+    # 2.99 and 3.01 straddle the cut but round to z=2.4 and z=3.6.
+    np.testing.assert_array_equal(engine.fragment_labels_at_points(doc, points), [2, 1, 0, 0])
+    assert engine.fragment_labels_at_points(doc, np.empty((0, 3))).size == 0
+    with pytest.raises(ValueError, match="finite Nx3"):
+        engine.fragment_labels_at_points(doc, [[float("nan"), 0, 0]])
+
+
+@pytest.mark.parametrize("level", [0, 4, True, 1.0, "II"])
+def test_default_cuts_reject_invalid_lefort_level(level):
+    with pytest.raises(ValueError, match="Le Fort level"):
+        engine.default_cuts(document(), level)
+
+
+@pytest.mark.parametrize("groups", [[], [[]], [["missing"]], [[42]]])
+def test_invalid_upper_cut_groups_fail_clearly(groups):
+    doc = document()
+    doc.anatomy.fill(2)
+    doc.plan.cuts["lefort"]["enabled"] = True
+    doc.plan.cuts["lefort"]["groups"] = groups
+    with pytest.raises(ValueError, match="plane groups"):
+        engine.build_fragments(doc, validate=False)
+
+
+@pytest.mark.parametrize("level", [1, 2, 3])
+@pytest.mark.parametrize("layout", ["dense", "sparse", "empty_slabs"])
+@pytest.mark.parametrize("oblique", [False, True])
+def test_foreground_cutting_matches_dense_grid_reference(level, layout, oblique, monkeypatch):
+    source = np.ones((12, 14, 16), dtype=np.uint8)
+    if layout == "sparse":
+        source.fill(0)
+        source[::3, ::4, ::5] = 1
+    elif layout == "empty_slabs":
+        source[2:8] = 0
+    doc = document(source, spacing=(0.4, 0.7, 1.2))
+    if oblique:
+        doc.geometry.direction = tuple(np.array([
+            [0.8, -0.6, 0], [0.6, 0.8, 0], [0, 0, -1],
+        ]).ravel())
+        doc.geometry.origin = (15.0, -23.0, 8.0)
+        doc.frame[:3, :3] = np.array([[0.6, -0.8, 0], [0.8, 0.6, 0], [0, 0, 1]])
+        doc.frame[:3, 3] = [4, -8, 2]
+    doc.anatomy[:6] = source[:6] * 3
+    doc.anatomy[6:] = source[6:] * 2
+    doc.anatomy[0, 0, 0] = 4
+    doc.anatomy[-1, -1, -1] = int(source[-1, -1, -1])
+    doc.plan.lefort_level = level
+    doc.plan.cuts = engine.default_cuts(doc, level)
+    for cut in doc.plan.cuts.values():
+        cut["enabled"] = True
+    # A deliberately tiny slab budget exercises empty slabs and slab offsets.
+    monkeypatch.setattr(engine, "CUT_SLAB_VOXELS", source.shape[1] * source.shape[2] * 2)
+    affine = doc.frame @ doc.geometry.affine
+    z, y, x = np.ogrid[:source.shape[0], :source.shape[1], :source.shape[2]]
+    points = tuple(
+        affine[axis, 0] * x + affine[axis, 1] * y + affine[axis, 2] * z + affine[axis, 3]
+        for axis in range(3)
+    )
+    expected = np.array([0, 8, 1, 5, 7], dtype=np.uint8)[doc.anatomy]
+    engine._cut_fragment_labels(expected, points, doc.plan)
+    original = doc.source.copy()
+    messages, visited = [], []
+    cut_labels = engine._cut_fragment_labels
+
+    def only_foreground(labels, coordinates, plan):
+        assert labels.ndim == 1
+        assert labels.size <= engine.CUT_SLAB_VOXELS
+        assert not np.any(labels == 0), "Background must not reach expensive plane predicates"
+        assert all(values.shape == labels.shape for values in coordinates)
+        visited.append(labels.size)
+        cut_labels(labels, coordinates, plan)
+
+    monkeypatch.setattr(engine, "_cut_fragment_labels", only_foreground)
+    actual = engine.build_fragments(doc, validate=False, progress=lambda *value: messages.append(value))
+    np.testing.assert_array_equal(actual, expected)
+    np.testing.assert_array_equal(doc.source, original)
+    assert sum(visited) == np.count_nonzero(doc.source)
+    assert messages[-1] == (1.0, "Fragment preview ready")
+    assert len([message for _, message in messages if message == "Partitioning bone fragments"]) == 6
+
+
+def test_cut_foreground_workspaces_remain_bounded_with_wide_noncontiguous_input(monkeypatch):
+    doc = document(np.ones((2, 14, 16), dtype=np.uint8), frame=np.eye(4))
+    doc.source = doc.source[:, :, ::-1]
+    doc.anatomy = (doc.source * 2)[:, :, ::-1]
+    assert not doc.anatomy.flags.c_contiguous
+    doc.plan.cuts["lefort"] = upper_cut([0, 0, 0.5], [0, 0, -1])
+    # An entire XY plane is much larger than the deliberately tiny budget.
+    monkeypatch.setattr(engine, "CUT_SLAB_VOXELS", 31)
+    sizes = []
+    classify = engine._cut_fragment_labels
+
+    def bounded(labels, points, plan):
+        sizes.append(labels.size)
+        assert labels.size <= 31
+        classify(labels, points, plan)
+
+    monkeypatch.setattr(engine, "_cut_fragment_labels", bounded)
+    fragments = engine.build_fragments(doc, validate=False)
+    np.testing.assert_array_equal(fragments[0], 2)
+    np.testing.assert_array_equal(fragments[1], 1)
+    assert sum(sizes) == doc.source.size

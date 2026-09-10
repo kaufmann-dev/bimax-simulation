@@ -14,7 +14,10 @@ def anatomy_counts(labels):
 
 
 def execute(operation, doc, options):
+    from copy import deepcopy
+
     from .engine import build_fragments, default_cuts, label_counts, load_volume, separate
+    from .model import CutPlan
     from .storage import export_labelmaps, load_project, save_project
     from .surface_cache import cached_surfaces
 
@@ -32,11 +35,14 @@ def execute(operation, doc, options):
             if operation == "import"
             else load_project(options["path"])
         )
-        if not doc.cuts:
-            doc.cuts = default_cuts(doc)
+        if not doc.plan.cuts:
+            doc.plan.cuts = default_cuts(doc, doc.plan.lefort_level)
         progress(0, "Building anatomy display")
         surface_sets = {False: surfaces(doc.anatomy)}
-        if doc.fragments is not None:
+        if doc.plan.accepted:
+            progress(0, f"Preparing {doc.plan.name}")
+            doc.fragments = build_fragments(doc, validate=True, progress=progress)
+            doc.fragments_key = doc.configuration_key
             progress(0, "Building fragment display")
             surface_sets[True] = surfaces(doc.fragments)
         return {
@@ -59,6 +65,27 @@ def execute(operation, doc, options):
             "fragments": labels,
             "surfaces": surfaces(labels),
             "fragment_counts": label_counts(labels, 8),
+            "configuration_key": doc.configuration_key,
+        }
+    if operation == "prepare_plan":
+        if not doc.plan.accepted:
+            raise ValueError("Preview and accept this cut plan before movement.")
+        labels = build_fragments(doc, validate=True, progress=progress)
+        return {
+            "fragments": labels,
+            "surfaces": surfaces(labels),
+            "configuration_key": doc.configuration_key,
+        }
+    if operation == "create_plan":
+        level = options["level"]
+        cuts = (
+            deepcopy(doc.plan.cuts) if level == doc.plan.lefort_level else default_cuts(doc, level)
+        )
+        for operation_key in ("bsso", "genio"):
+            cuts[operation_key] = deepcopy(doc.plan.cuts[operation_key])
+        return {
+            "plan_id": options["plan_id"],
+            "plan": CutPlan(options["name"], lefort_level=level, cuts=cuts),
         }
     if operation == "surfaces":
         fragment_mode = doc.fragments is not None and not options.get("anatomy", False)
@@ -67,6 +94,7 @@ def execute(operation, doc, options):
             "surfaces": surfaces(labels),
             "fragment_mode": fragment_mode,
             "anatomy_counts": anatomy_counts(doc.anatomy),
+            "configuration_key": doc.configuration_key,
         }
     if operation == "component":
         from .engine import component_indices

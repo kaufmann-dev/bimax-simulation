@@ -16,25 +16,31 @@ import numpy as np
 import SimpleITK as sitk
 from scipy import ndimage
 
-from bimax.model import FRAGMENTS, Document, Geometry, Motion
+from bimax.model import FRAGMENTS, CutPlan, Document, Geometry, Motion, Scenario
 
-_VERSION = 1
+_VERSION = 2
 _MAX_METADATA = 8 * 1024 * 1024
 _MAX_VOXELS = 2**31 - 1
-_VOLUMES = ("source", "anatomy", "seeds", "barriers", "fragments")
+_VOLUMES = ("source", "anatomy", "seeds", "barriers")
 _MOTION_KEYS = {"linked", "maxilla", "mandible", "chin"}
+_MAX_CONFIGURATIONS = 256
+_MAX_PLANES = 64
 
 
 def _vector(value: Any, length: int, name: str) -> np.ndarray:
     if not isinstance(value, (list, tuple, np.ndarray)):
         raise ValueError(f"{name} must contain {length} finite numbers.")
     try:
-        array = np.asarray(value, dtype=float)
+        array = np.asarray(value)
     except (TypeError, ValueError) as exc:
         raise ValueError(f"{name} must contain {length} finite numbers.") from exc
-    if array.shape != (length,) or not np.all(np.isfinite(array)):
+    if array.shape != (length,) or array.dtype.kind not in "iuf" or not np.all(np.isfinite(array)):
         raise ValueError(f"{name} must contain {length} finite numbers.")
-    return array
+    return array.astype(float)
+
+
+def _name(value: Any) -> bool:
+    return isinstance(value, str) and bool(value.strip()) and len(value) <= 256
 
 
 def _geometry(value: Any) -> Geometry:
@@ -60,19 +66,20 @@ def _plane(value: Any, name: str) -> None:
     if not isinstance(value, dict) or set(value) != {"origin", "normal"}:
         raise ValueError(f"{name} needs an origin and normal.")
     _vector(value["origin"], 3, name + " origin")
-    if np.linalg.norm(_vector(value["normal"], 3, name + " normal")) < 1e-8:
-        raise ValueError(f"{name} normal cannot be zero.")
+    length = np.linalg.norm(_vector(value["normal"], 3, name + " normal"))
+    if not np.isfinite(length) or length < 1e-8:
+        raise ValueError(f"{name} normal must have a finite, nonzero length.")
 
 
 def _validate_cuts(cuts: Any) -> None:
-    if not isinstance(cuts, dict) or set(cuts) - {"lefort", "bsso", "genio"}:
-        raise ValueError("Unknown operation in project cut definitions.")
+    if not isinstance(cuts, dict) or set(cuts) != {"lefort", "bsso", "genio"}:
+        raise ValueError("Cut plans must define Le Fort, BSSO and genioplasty operations.")
     for name, cut in cuts.items():
-        expected = (
-            {"enabled", "midline", "left", "right"}
-            if name == "bsso"
-            else {"enabled", "plane", "region"}
-        )
+        expected = {
+            "lefort": {"enabled", "planes", "groups", "region"},
+            "bsso": {"enabled", "midline", "left", "right"},
+            "genio": {"enabled", "plane", "region"},
+        }[name]
         if not isinstance(cut, dict) or set(cut) != expected or type(cut["enabled"]) is not bool:
             raise ValueError(f"Invalid {name} cut definition.")
         if name == "bsso":
@@ -87,7 +94,31 @@ def _validate_cuts(cuts: Any) -> None:
                 for kind, plane in cut[side].items():
                     _plane(plane, f"BSSO {side} {kind}")
         else:
-            _plane(cut["plane"], name)
+            if name == "lefort":
+                planes = cut["planes"]
+                if (
+                    not isinstance(planes, dict)
+                    or not 1 <= len(planes) <= _MAX_PLANES
+                    or any(not _name(key) for key in planes)
+                ):
+                    raise ValueError("Le Fort cuts need between 1 and 64 named planes.")
+                for key, plane in planes.items():
+                    _plane(plane, f"Le Fort {key}")
+                groups = cut["groups"]
+                if (
+                    not isinstance(groups, list)
+                    or not 1 <= len(groups) <= _MAX_PLANES
+                    or any(
+                        not isinstance(group, list)
+                        or not 1 <= len(group) <= _MAX_PLANES
+                        or any(not isinstance(key, str) or key not in planes for key in group)
+                        or len(group) != len(set(group))
+                        for group in groups
+                    )
+                ):
+                    raise ValueError("Le Fort groups must reference nonempty sets of named planes.")
+            else:
+                _plane(cut["plane"], name)
             region = cut["region"]
             if not isinstance(region, dict) or set(region) != {"min", "max"}:
                 raise ValueError(f"Invalid {name} region.")
@@ -103,35 +134,34 @@ def _metadata(doc: Document) -> dict[str, Any]:
         "version": _VERSION,
         "geometry": asdict(doc.geometry),
         "frame": doc.frame.tolist(),
-        "cuts": doc.cuts,
-        "confirmations": doc.confirmations,
-        "scenarios": {
-            name: {key: asdict(motion) for key, motion in motions.items()}
-            for name, motions in doc.scenarios.items()
-        },
+        "plans": {key: asdict(plan) for key, plan in doc.plans.items()},
+        "scenarios": {name: asdict(scenario) for name, scenario in doc.scenarios.items()},
         "active_scenario": doc.active_scenario,
-        "landmarks": doc.landmarks,
+        "anatomy_revision": doc.anatomy_revision,
         "source_name": doc.source_name,
         "revision": doc.revision,
-        "volumes": [name for name in _VOLUMES if getattr(doc, name) is not None],
+        "volumes": list(_VOLUMES),
     }
 
 
-def _validated_metadata(value: Any) -> tuple[Geometry, dict[str, dict[str, Motion]]]:
+def _validated_metadata(value: Any) -> tuple[Geometry, dict[str, CutPlan], dict[str, Scenario]]:
+    from bimax.engine import required_fragment_labels
+
     fields = {
         "format",
         "version",
         "geometry",
         "frame",
-        "cuts",
-        "confirmations",
+        "plans",
         "scenarios",
         "active_scenario",
-        "landmarks",
+        "anatomy_revision",
         "source_name",
         "revision",
         "volumes",
     }
+    if isinstance(value, dict) and value.get("format") == "bimax" and value.get("version") != _VERSION:
+        raise ValueError("Unsupported BIMAX project version. Open a version 2 project or import a volume to start a new one.")
     if (
         not isinstance(value, dict)
         or set(value) != fields
@@ -150,26 +180,50 @@ def _validated_metadata(value: Any) -> tuple[Geometry, dict[str, dict[str, Motio
         or not np.isclose(np.linalg.det(frame[:3, :3]), 1.0)
     ):
         raise ValueError("Planning frame must be a finite, right-handed rigid transform.")
-    _validate_cuts(value["cuts"])
-    if not isinstance(value["confirmations"], dict):
-        raise ValueError("Fragment confirmation points must be an object.")
-    for key, point in value["confirmations"].items():
-        if key not in {str(label) for label in FRAGMENTS}:
-            raise ValueError("Unknown fragment confirmation label.")
-        _vector(point, 3, "Fragment confirmation")
-    scenarios: dict[str, dict[str, Motion]] = {}
-    if not isinstance(value["scenarios"], dict) or not value["scenarios"]:
-        raise ValueError("A project needs at least one movement scenario.")
-    for name, motions in value["scenarios"].items():
+    plans: dict[str, CutPlan] = {}
+    if not isinstance(value["plans"], dict) or not 1 <= len(value["plans"]) <= _MAX_CONFIGURATIONS:
+        raise ValueError("A project needs between 1 and 256 cut plans.")
+    for key, plan in value["plans"].items():
         if (
-            not isinstance(name, str)
-            or not name.strip()
-            or not isinstance(motions, dict)
-            or set(motions) != _MOTION_KEYS
+            not _name(key)
+            or not isinstance(plan, dict)
+            or set(plan) != {"name", "lefort_level", "cuts", "confirmations", "accepted", "revision"}
+            or not _name(plan["name"])
+            or type(plan["lefort_level"]) is not int
+            or plan["lefort_level"] not in {1, 2, 3}
+            or type(plan["accepted"]) is not bool
+            or type(plan["revision"]) is not int
+            or plan["revision"] < 0
         ):
-            raise ValueError("Invalid movement scenario.")
-        scenarios[name] = {}
-        for key, motion in motions.items():
+            raise ValueError("Invalid cut plan identity, level or review state.")
+        _validate_cuts(plan["cuts"])
+        if not isinstance(plan["confirmations"], dict):
+            raise ValueError("Fragment confirmation points must be an object.")
+        for label, point in plan["confirmations"].items():
+            if label not in {"2", "3", "4", "5", "6"}:
+                raise ValueError("Unknown fragment confirmation label.")
+            _vector(point, 3, "Fragment confirmation")
+        plans[key] = CutPlan(**plan)
+        if plan["accepted"] and any(
+            str(label) not in plan["confirmations"] for label in required_fragment_labels(plans[key])
+        ):
+            raise ValueError("Accepted cut plans need confirmation points for every required fragment.")
+    scenarios: dict[str, Scenario] = {}
+    if not isinstance(value["scenarios"], dict) or not 1 <= len(value["scenarios"]) <= _MAX_CONFIGURATIONS:
+        raise ValueError("A project needs at least one movement scenario.")
+    for name, scenario in value["scenarios"].items():
+        if (
+            not _name(name)
+            or not isinstance(scenario, dict)
+            or set(scenario) != {"plan_id", "motions", "landmarks"}
+            or not isinstance(scenario["plan_id"], str)
+            or scenario["plan_id"] not in plans
+            or not isinstance(scenario["motions"], dict)
+            or set(scenario["motions"]) != _MOTION_KEYS
+        ):
+            raise ValueError("Invalid movement scenario or referenced cut plan.")
+        motions = {}
+        for key, motion in scenario["motions"].items():
             if (
                 not isinstance(motion, dict)
                 or set(motion) != {"translation", "angles", "pivot", "pivot_set"}
@@ -178,40 +232,41 @@ def _validated_metadata(value: Any) -> tuple[Geometry, dict[str, dict[str, Motio
                 raise ValueError("Invalid movement parameters.")
             for field in ("translation", "angles", "pivot"):
                 _vector(motion[field], 3, f"{name} {key} {field}")
-            scenarios[name][key] = Motion(**motion)
+            motions[key] = Motion(**motion)
+        landmarks = scenario["landmarks"]
+        if not isinstance(landmarks, list) or any(not isinstance(item, dict) for item in landmarks):
+            raise ValueError("Scenario landmarks must be a list of objects.")
+        for landmark in landmarks:
+            if (
+                set(landmark) != {"name", "point", "fragment"}
+                or not _name(landmark["name"])
+                or type(landmark["fragment"]) is not int
+                or landmark["fragment"] not in FRAGMENTS
+            ):
+                raise ValueError("Invalid scenario landmark.")
+            _vector(landmark["point"], 3, "Landmark point")
+        scenarios[name] = Scenario(plan_id=scenario["plan_id"], motions=motions, landmarks=landmarks)
     if not isinstance(value["active_scenario"], str) or value["active_scenario"] not in scenarios:
         raise ValueError("Active scenario is missing from the project.")
     if (
         not isinstance(value["source_name"], str)
         or type(value["revision"]) is not int
         or value["revision"] < 0
+        or type(value["anatomy_revision"]) is not int
+        or value["anatomy_revision"] < 0
     ):
         raise ValueError("Invalid project source name or revision.")
-    if not isinstance(value["landmarks"], list) or any(
-        not isinstance(landmark, dict) for landmark in value["landmarks"]
-    ):
-        raise ValueError("Project landmarks must be a list of objects.")
-    for landmark in value["landmarks"]:
-        if (
-            set(landmark) != {"name", "point", "fragment"}
-            or not isinstance(landmark["name"], str)
-            or not landmark["name"].strip()
-            or type(landmark["fragment"]) is not int
-            or landmark["fragment"] not in FRAGMENTS
-        ):
-            raise ValueError("Invalid project landmark.")
-        _vector(landmark["point"], 3, "Landmark point")
     volumes = value["volumes"]
-    if volumes not in [list(_VOLUMES), list(_VOLUMES[:-1])]:
+    if volumes != list(_VOLUMES):
         raise ValueError("Project volume list is incomplete or unsupported.")
     # This also rejects NaN and infinity anywhere in generic JSON fields.
     json.dumps(value, allow_nan=False)
-    return geometry, scenarios
+    return geometry, plans, scenarios
 
 
 def _validate_arrays(doc: Document) -> None:
     shape = doc.geometry.shape
-    for name in _VOLUMES:
+    for name in (*_VOLUMES, "fragments"):
         array = getattr(doc, name)
         if array is None and name == "fragments":
             continue
@@ -227,6 +282,14 @@ def _validate_arrays(doc: Document) -> None:
         ):
             raise ValueError(f"{name.title()} must be a uint8 volume matching the source geometry.")
     any_bone = False
+    any_reviewed = any(plan.accepted for plan in doc.plans.values())
+    if doc.fragments is None:
+        if doc.fragments_key is not None:
+            raise ValueError("Fragment geometry key exists without active fragment geometry.")
+    elif not doc.plan.accepted or doc.fragments_key != doc.configuration_key:
+        raise ValueError("Active fragments are stale or unreviewed; rebuild and review the active cut plan.")
+    anatomy_counts = np.zeros(5, dtype=np.int64)
+    fragment_counts = np.zeros(9, dtype=np.int64)
     # Bound temporary masks even on the full-resolution skull volume.
     depth = max(1, 1_000_000 // (shape[1] * shape[2]))
     parent = np.array([0, 2, 2, 3, 3, 3, 3, 4, 1], dtype=np.uint8)
@@ -240,6 +303,8 @@ def _validate_arrays(doc: Document) -> None:
             raise ValueError("Source must be a binary bone mask containing only 0 and 1.")
         if np.any(anatomy > 4) or not np.array_equal(anatomy != 0, bone):
             raise ValueError("Anatomical labels must preserve every source foreground voxel.")
+        if any_reviewed and np.any(anatomy == 1):
+            raise ValueError("Assign all bone to anatomy or explicitly exclude it before accepting cuts.")
         if np.any(seeds > 4) or np.any(seeds == 1) or np.any((seeds != 0) & ~bone):
             raise ValueError("Seeds must be 0, 2, 3 or 4 and lie inside source bone.")
         if np.any(barriers > 1) or np.any((barriers != 0) & ~bone):
@@ -252,8 +317,25 @@ def _validate_arrays(doc: Document) -> None:
                 raise ValueError(
                     "Fragment ownership does not match its anatomical parent; rebuild cuts."
                 )
+            anatomy_counts += np.bincount(anatomy.ravel(), minlength=5)
+            fragment_counts += np.bincount(fragments.ravel(), minlength=9)
     if not any_bone:
         raise ValueError("Source bone mask is empty.")
+    if any_reviewed:
+        from bimax.engine import fragment_labels_at_points, required_fragment_labels
+
+        for plan in doc.plans.values():
+            required = sorted(required_fragment_labels(plan)) if plan.accepted else []
+            if not required:
+                continue
+            points = np.asarray([plan.confirmations[str(label)] for label in required])
+            actual = fragment_labels_at_points(doc, points, plan)
+            if not np.array_equal(actual, required):
+                raise ValueError(f"Accepted cut plan '{plan.name}' has confirmation points outside their fragments.")
+    if doc.fragments is not None:
+        from bimax.engine import validate_fragment_preview
+
+        validate_fragment_preview(doc, doc.fragments, fragment_counts, anatomy_counts)
 
 
 def _image(array: np.ndarray, geometry: Geometry) -> Any:
@@ -341,7 +423,7 @@ def load_project(path: str | Path) -> Document:
                 parse_constant=_reject_constant,
                 object_pairs_hook=_unique_object,
             )
-            geometry, scenarios = _validated_metadata(metadata)
+            geometry, plans, scenarios = _validated_metadata(metadata)
             expected = {"project.json"} | {f"volumes/{name}.nii.gz" for name in metadata["volumes"]}
             if set(names) != expected:
                 raise ValueError("Project archive contains missing or unexpected members.")
@@ -363,13 +445,11 @@ def load_project(path: str | Path) -> Document:
                 anatomy=arrays["anatomy"],
                 seeds=arrays["seeds"],
                 barriers=arrays["barriers"],
-                fragments=arrays.get("fragments"),
                 frame=np.asarray(metadata["frame"], dtype=float),
-                cuts=metadata["cuts"],
-                confirmations=metadata["confirmations"],
+                plans=plans,
                 scenarios=scenarios,
                 active_scenario=metadata["active_scenario"],
-                landmarks=metadata["landmarks"],
+                anatomy_revision=metadata["anatomy_revision"],
                 source_name=metadata["source_name"],
                 revision=metadata["revision"],
             )
@@ -414,12 +494,15 @@ def _export_grid(doc: Document, transforms: dict[int, np.ndarray]) -> tuple[Geom
 
 def export_labelmaps(doc: Document, output_dir: str | Path) -> Path:
     """Export separate binary fragments on a shared grid, preserving overlaps."""
-    from bimax.engine import fragment_transforms
+    from bimax.engine import build_fragments, fragment_transforms
 
     _validated_metadata(_metadata(doc))
+    if not doc.plan.accepted:
+        raise ValueError("Build and review the active operation plan before exporting.")
     _validate_arrays(doc)
     if doc.fragments is None:
-        raise ValueError("Build and review operation fragments before exporting.")
+        doc.fragments = build_fragments(doc, validate=True)
+        doc.fragments_key = doc.configuration_key
     if np.any(doc.anatomy == 1) or np.any(doc.fragments == 8):
         raise ValueError("Assign or explicitly exclude every foreground voxel before exporting.")
     destination = Path(output_dir).absolute()
@@ -433,6 +516,16 @@ def export_labelmaps(doc: Document, output_dir: str | Path) -> Path:
         "format": "bimax-labelmaps",
         "version": _VERSION,
         "scenario": doc.active_scenario,
+        "plan": {
+            "id": doc.scenario.plan_id,
+            "name": doc.plan.name,
+            "lefort_level": doc.plan.lefort_level,
+            "lefort": doc.plan.cuts["lefort"]["enabled"],
+            "bsso": doc.plan.cuts["bsso"]["enabled"],
+            "genioplasty": doc.plan.cuts["genio"]["enabled"],
+            "revision": doc.plan.revision,
+            "anatomy_revision": doc.anatomy_revision,
+        },
         "source_name": doc.source_name,
         "physical_coordinates": "LPS millimetres",
         "array_order": "ZYX",
@@ -466,12 +559,12 @@ def export_labelmaps(doc: Document, output_dir: str | Path) -> Path:
                 0,
                 sitk.sitkUInt8,
             )
-            filename = f"{label:02d}-{FRAGMENTS[label].lower().replace(' ', '-')}.nii.gz"
+            filename = f"{label:02d}-{doc.fragment_names[label].lower().replace(' ', '-')}.nii.gz"
             sitk.WriteImage(result, str(temporary / filename), True)
             manifest["fragments"].append(
                 {
                     "id": label,
-                    "name": FRAGMENTS[label],
+                    "name": doc.fragment_names[label],
                     "file": filename,
                     "transform_lps": transforms[label].tolist(),
                 }

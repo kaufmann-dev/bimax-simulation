@@ -11,11 +11,12 @@ import SimpleITK as sitk
 from scipy import ndimage as ndi
 from skimage.segmentation import watershed
 
-from bimax.model import FRAGMENTS, Document, Geometry, Motion
+from bimax.model import CutPlan, Document, Geometry, Motion
 
 Progress = Callable[[float, str], None] | None
 MEMORY_BUDGET = 16 * 1024**3
 FACE_CONNECTIVITY = ndi.generate_binary_structure(3, 1)
+CUT_SLAB_VOXELS = 2_000_000
 
 
 def _report(progress: Progress, value: float, message: str) -> None:
@@ -143,7 +144,7 @@ def load_volume(path: str | Path, progress: Progress = None) -> Document:
         barriers=np.zeros(source.shape, dtype=bool),
         source_name=path.name,
     )
-    doc.cuts = default_cuts(doc)
+    doc.plan.cuts = default_cuts(doc)
     _report(progress, 1.0, "Binary bone volume ready")
     return doc
 
@@ -159,8 +160,15 @@ def planning_bounds(doc: Document) -> tuple[np.ndarray, np.ndarray]:
     return points.min(axis=0), points.max(axis=0)
 
 
-def default_cuts(doc: Document) -> dict[str, Any]:
-    """Editable suggestions only; cuts remain disabled until chosen by the user."""
+def default_cuts(doc: Document, lefort_level: int = 1) -> dict[str, Any]:
+    """Approximate editable envelopes, disabled until deliberately selected.
+
+    Higher-level templates are piecewise planar regions, not single raised
+    Le Fort I planes. They are geometric suggestions, not anatomical detection
+    or clinically valid osteotomy trajectories.
+    """
+    if type(lefort_level) is not int or lefort_level not in (1, 2, 3):
+        raise ValueError("Le Fort level must be I, II or III.")
     low, high = planning_bounds(doc)
     extent = high - low
     centre = (low + high) / 2
@@ -170,6 +178,45 @@ def default_cuts(doc: Document) -> dict[str, Any]:
 
     def region(minimum: Any, maximum: Any) -> dict[str, Any]:
         return {"min": list(map(float, minimum)), "max": list(map(float, maximum))}
+
+    if lefort_level == 1:
+        upper_planes = {
+            "upper": plane([centre[0], centre[1], low[2] + extent[2] * 0.43], [0, 0, -1])
+        }
+        groups = [["upper"]]
+    else:
+        apex = low[2] + extent[2] * (0.63 if lefort_level == 2 else 0.67)
+        valley = low[2] + extent[2] * (0.48 if lefort_level == 2 else 0.51)
+        slope = (apex - valley) / max(extent[0] * 0.22, 1e-6)
+        posterior_slope = extent[2] * 0.24 / max(extent[1] * 0.28, 1e-6)
+        upper_planes = {
+            "left_oblique": plane([centre[0], centre[1], apex], [slope, 0, -1]),
+            "right_oblique": plane([centre[0], centre[1], apex], [-slope, 0, -1]),
+            "posterior": plane(
+                [centre[0], low[1] + extent[1] * 0.35, low[2] + extent[2] * 0.43],
+                [0, posterior_slope, -1],
+            ),
+        }
+        groups = [["left_oblique", "right_oblique", "posterior"]]
+        if lefort_level == 3:
+            # The union adds lateral wings while retaining two lower valleys
+            # beside the central peak; one convex clipping volume cannot do so.
+            wing_slope = extent[2] * 0.16 / max(extent[0] * 0.22, 1e-6)
+            upper_planes.update({
+                "left_wing": plane(
+                    [centre[0] - extent[0] * 0.22, centre[1], valley], [-wing_slope, 0, -1]
+                ),
+                "right_wing": plane(
+                    [centre[0] + extent[0] * 0.22, centre[1], valley], [wing_slope, 0, -1]
+                ),
+                "wing_ceiling": plane(
+                    [centre[0], centre[1], low[2] + extent[2] * 0.67], [0, 0, -1]
+                ),
+            })
+            groups.extend([
+                ["left_wing", "wing_ceiling", "posterior"],
+                ["right_wing", "wing_ceiling", "posterior"],
+            ])
 
     sides = {}
     for side, sign in (("left", -1), ("right", 1)):
@@ -181,7 +228,8 @@ def default_cuts(doc: Document) -> dict[str, Any]:
     return {
         "lefort": {
             "enabled": False,
-            "plane": plane([centre[0], centre[1], low[2] + extent[2] * 0.43], [0, 0, -1]),
+            "planes": upper_planes,
+            "groups": groups,
             "region": region([low[0], low[1] + extent[1] * 0.35, low[2]], high),
         },
         "bsso": {"enabled": False, "midline": float(centre[0]), **sides},
@@ -300,21 +348,42 @@ def _plane_mask(points: tuple[np.ndarray, ...], plane: dict[str, Any]) -> np.nda
 
 
 def _bounded_mask(points: tuple[np.ndarray, ...], cut: dict[str, Any]) -> np.ndarray:
-    minimum = _vector(cut["region"]["min"], "Region minimum")
-    maximum = _vector(cut["region"]["max"], "Region maximum")
+    return _within_region(points, cut["region"], _plane_mask(points, cut["plane"]))
+
+
+def _within_region(
+    points: tuple[np.ndarray, ...], region: dict[str, Any], mask: np.ndarray
+) -> np.ndarray:
+    minimum = _vector(region["min"], "Region minimum")
+    maximum = _vector(region["max"], "Region maximum")
     if np.any(maximum < minimum):
         raise ValueError("Region maxima must be greater than or equal to minima.")
-    mask = _plane_mask(points, cut["plane"])
     for axis in range(3):
         mask &= (points[axis] >= minimum[axis] - 1e-8) & (points[axis] <= maximum[axis] + 1e-8)
     return mask
 
 
-def _points_for_slab(doc: Document, start: int, stop: int) -> tuple[np.ndarray, ...]:
-    affine = doc.frame @ doc.geometry.affine
-    z, y, x = np.ogrid[start:stop, :doc.source.shape[1], :doc.source.shape[2]]
-    return tuple(affine[axis, 0] * x + affine[axis, 1] * y + affine[axis, 2] * z + affine[axis, 3]
-                 for axis in range(3))
+def _lefort_mask(points: tuple[np.ndarray, ...], cut: dict[str, Any]) -> np.ndarray:
+    """Union of convex half-space groups, clipped by a shared physical region."""
+    planes, groups = cut["planes"], cut["groups"]
+    if not isinstance(planes, dict) or not planes or not isinstance(groups, list) or not groups:
+        raise ValueError("A Le Fort cut needs named planes and nonempty plane groups.")
+    combined = None
+    for group in groups:
+        if (
+            not isinstance(group, list) or not group
+            or any(not isinstance(name, str) or name not in planes for name in group)
+        ):
+            raise ValueError("Le Fort plane groups must reference existing named planes.")
+        intersection = _plane_mask(points, planes[group[0]])
+        for name in group[1:]:
+            intersection &= _plane_mask(points, planes[name])
+        if combined is None:
+            combined = intersection
+        else:
+            combined |= intersection
+    assert combined is not None
+    return _within_region(points, cut["region"], combined)
 
 
 def label_counts(labels: np.ndarray, maximum_label: int) -> np.ndarray:
@@ -324,6 +393,67 @@ def label_counts(labels: np.ndarray, maximum_label: int) -> np.ndarray:
     for start in range(0, flat.size, 1_000_000):
         counts += np.bincount(flat[start : start + 1_000_000], minlength=maximum_label + 1)
     return counts
+
+
+def required_fragment_labels(plan: CutPlan) -> set[int]:
+    required = set()
+    if plan.cuts.get("lefort", {}).get("enabled", False):
+        required.add(2)
+    if plan.cuts.get("bsso", {}).get("enabled", False):
+        required.update((3, 4, 5))
+    if plan.cuts.get("genio", {}).get("enabled", False):
+        required.update((5, 6))
+    return required
+
+
+def _cut_fragment_labels(
+    labels: np.ndarray, points: tuple[np.ndarray, ...], plan: CutPlan
+) -> None:
+    lefort = plan.cuts.get("lefort", {"enabled": False})
+    bsso = plan.cuts.get("bsso", {"enabled": False})
+    genio = plan.cuts.get("genio", {"enabled": False})
+    if lefort["enabled"]:
+        labels[(labels == 1) & _lefort_mask(points, lefort)] = 2
+    if bsso["enabled"]:
+        midline = float(bsso["midline"])
+        if not np.isfinite(midline):
+            raise ValueError("The BSSO midline must be finite.")
+        for side, label in (("left", 3), ("right", 4)):
+            planes = bsso[side]
+            side_mask = points[0] < midline if side == "left" else points[0] >= midline
+            proximal = (
+                side_mask & _plane_mask(points, planes["front"])
+                & (_plane_mask(points, planes["upper"]) | _plane_mask(points, planes["sagittal"]))
+            )
+            labels[(labels == 5) & proximal] = label
+    if genio["enabled"]:
+        labels[(labels == 5) & _bounded_mask(points, genio)] = 6
+
+
+def fragment_labels_at_points(
+    doc: Document, points: Any, plan: CutPlan | None = None
+) -> np.ndarray:
+    """Evaluate exact cut ownership at nearest voxel centres, outside as zero.
+
+    Points are Nx3 baseline planning coordinates. This shared predicate path
+    validates inactive plans' confirmation samples without allocating volumes.
+    """
+    values = np.asarray(points, dtype=float)
+    if values.ndim != 2 or values.shape[1] != 3 or not np.all(np.isfinite(values)):
+        raise ValueError("Fragment samples must be finite Nx3 planning coordinates.")
+    xyz = np.rint(doc.geometry.world_to_index(doc.plan_to_world(values)))
+    inside = np.all((xyz >= 0) & (xyz < np.asarray(doc.geometry.shape[::-1])), axis=1)
+    result = np.zeros(len(values), dtype=np.uint8)
+    indices = xyz[inside].astype(np.intp)
+    if not len(indices):
+        return result
+    centres = doc.world_to_plan(doc.geometry.index_to_world(indices))
+    labels = np.array([0, 8, 1, 5, 7], dtype=np.uint8)[
+        doc.anatomy[indices[:, 2], indices[:, 1], indices[:, 0]]
+    ]
+    _cut_fragment_labels(labels, tuple(centres[:, axis] for axis in range(3)), plan or doc.plan)
+    result[inside] = labels
+    return result
 
 
 def validate_fragment_preview(
@@ -382,25 +512,18 @@ def validate_fragment_preview(
         or not np.allclose(direction.T @ direction, np.eye(3), atol=1e-5)
     ):
         raise ValueError("The input has invalid physical geometry.")
-    required = set()
-    if doc.cuts.get("lefort", {}).get("enabled", False):
-        required.add(2)
-    if doc.cuts.get("bsso", {}).get("enabled", False):
-        required.update((3, 4, 5))
-    if doc.cuts.get("genio", {}).get("enabled", False):
-        required.update((5, 6))
-    for label in sorted(required):
+    for label in sorted(required_fragment_labels(doc.plan)):
         if not fragment_counts[label]:
-            raise ValueError(f"The cuts leave {FRAGMENTS[label]} empty. Adjust the cut geometry.")
-        confirmation = doc.confirmations.get(str(label))
+            raise ValueError(f"The cuts leave {doc.fragment_names[label]} empty. Adjust the cut geometry.")
+        confirmation = doc.plan.confirmations.get(str(label))
         if confirmation is None:
-            raise ValueError(f"Place a confirmation point inside {FRAGMENTS[label]} before accepting cuts.")
+            raise ValueError(f"Place a confirmation point inside {doc.fragment_names[label]} before accepting cuts.")
         point = _vector(confirmation, "Fragment confirmation")
         xyz = np.rint(doc.geometry.world_to_index(doc.plan_to_world(point)))
         zyx = xyz[::-1]
         if (not np.all(np.isfinite(zyx)) or np.any(zyx < 0) or np.any(zyx >= fragments.shape)
                 or fragments[tuple(zyx.astype(int))] != label):
-            raise ValueError(f"The confirmation point for {FRAGMENTS[label]} is outside its fragment.")
+            raise ValueError(f"The confirmation point for {doc.fragment_names[label]} is outside its fragment.")
 
 
 def build_fragments(doc: Document, validate: bool = True, progress: Progress = None) -> np.ndarray:
@@ -411,32 +534,27 @@ def build_fragments(doc: Document, validate: bool = True, progress: Progress = N
         raise ValueError("Assign all bone to anatomy or explicitly exclude it before accepting cuts.")
     _check_memory(doc, doc.source.size, bytes_per_voxel=3)
     fragments = np.array([0, 8, 1, 5, 7], dtype=np.uint8)[doc.anatomy]
-    lefort = doc.cuts.get("lefort", {"enabled": False})
-    bsso = doc.cuts.get("bsso", {"enabled": False})
-    genio = doc.cuts.get("genio", {"enabled": False})
-    slab_depth = max(1, 2_000_000 // (doc.source.shape[1] * doc.source.shape[2]))
-    if any(cut["enabled"] for cut in (lefort, bsso, genio)):
-        for start in range(0, doc.source.shape[0], slab_depth):
-            stop = min(start + slab_depth, doc.source.shape[0])
-            points = _points_for_slab(doc, start, stop)
-            labels = fragments[start:stop]
-            if lefort["enabled"]:
-                labels[(labels == 1) & _bounded_mask(points, lefort)] = 2
-            if bsso["enabled"]:
-                midline = float(bsso["midline"])
-                if not np.isfinite(midline):
-                    raise ValueError("The BSSO midline must be finite.")
-                for side, label in (("left", 3), ("right", 4)):
-                    planes = bsso[side]
-                    side_mask = points[0] < midline if side == "left" else points[0] >= midline
-                    proximal = (
-                        side_mask & _plane_mask(points, planes["front"])
-                        & (_plane_mask(points, planes["upper"]) | _plane_mask(points, planes["sagittal"]))
-                    )
-                    labels[(labels == 5) & proximal] = label
-            if genio["enabled"]:
-                labels[(labels == 5) & _bounded_mask(points, genio)] = 6
-            _report(progress, stop / doc.source.shape[0] * 0.9, "Partitioning bone fragments")
+    if any(cut["enabled"] for cut in doc.plan.cuts.values()):
+        affine = doc.frame @ doc.geometry.affine
+        for start in range(0, doc.source.size, CUT_SLAB_VOXELS):
+            stop = min(start + CUT_SLAB_VOXELS, doc.source.size)
+            # Flat slabs also bound unusually wide images and non-contiguous
+            # input arrays; no full-volume flattening copy is necessary.
+            indices = np.flatnonzero(doc.anatomy.flat[start:stop]) + start
+            if indices.size:
+                # Background dominates scans. Evaluate the identical physical
+                # half-space predicates only at occupied native voxel centres.
+                # Retain the original arithmetic order at cut boundaries.
+                z, y, x = np.unravel_index(indices, doc.source.shape)
+                points = tuple(
+                    affine[axis, 0] * x + affine[axis, 1] * y
+                    + affine[axis, 2] * z + affine[axis, 3]
+                    for axis in range(3)
+                )
+                occupied = fragments.flat[indices]
+                _cut_fragment_labels(occupied, points, doc.plan)
+                fragments.flat[indices] = occupied
+            _report(progress, stop / doc.source.size * 0.9, "Partitioning bone fragments")
     assert_partition(doc.source, fragments)
     if validate:
         assert counts is not None
@@ -469,11 +587,13 @@ def fragment_transforms(doc: Document) -> dict[int, np.ndarray]:
     """Baseline LPS-to-moved-LPS matrices; proximal fragments remain fixed."""
     linked = motion_matrix(doc.motions["linked"])
     mandible = linked @ motion_matrix(doc.motions["mandible"])
-    planning = {
-        2: linked @ motion_matrix(doc.motions["maxilla"]),
-        5: mandible,
-        6: mandible @ motion_matrix(doc.motions["chin"]),
-    }
+    planning = {5: mandible}
+    # A scenario may retain motion parameters while its associated plan omits
+    # that operation. Hidden motions must neither transform nor invalidate it.
+    if doc.plan.cuts.get("lefort", {}).get("enabled", False):
+        planning[2] = linked @ motion_matrix(doc.motions["maxilla"])
+    if doc.plan.cuts.get("genio", {}).get("enabled", False):
+        planning[6] = mandible @ motion_matrix(doc.motions["chin"])
     inverse = np.linalg.inv(doc.frame)
     result = {label: np.eye(4) for label in range(1, 9)}
     for label, transform in planning.items():
