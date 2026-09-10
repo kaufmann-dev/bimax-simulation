@@ -454,7 +454,9 @@ class FourViews(QWidget):
         self._baseline = False
         self._plane_updating = False
         self._camera_initialized = False
-        layout = QGridLayout(self)
+        self._3d_expanded = False
+        self._slice_panels: list[QWidget] = []
+        layout = self._grid = QGridLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(2)
         for i, view in enumerate(self.slices):
@@ -468,11 +470,12 @@ class FourViews(QWidget):
             slider.valueChanged.connect(lambda value, target=view: self._slider_moved(target, value))
             panel_layout.addWidget(slider)
             self.sliders.append(slider)
+            self._slice_panels.append(panel)
             layout.addWidget(panel, i // 2, i % 2)
             view.pointPicked.connect(self._point_picked)
             view.strokeFinished.connect(self.paintRequested.emit)
             view.sliceMoved.connect(self._slice_moved)
-        vtk_panel = QWidget()
+        vtk_panel = self._vtk_panel = QWidget()
         vtk_layout = QVBoxLayout(vtk_panel)
         vtk_layout.setContentsMargins(0, 0, 0, 0)
         vtk_layout.setSpacing(0)
@@ -507,6 +510,26 @@ class FourViews(QWidget):
         self.plane_widget.SetInteractor(self.interactor)
         self.plane_widget.SetRepresentation(self.plane_rep)
         self.plane_widget.AddObserver(vtkCommand.EndInteractionEvent, self._plane_changed)
+
+    @property
+    def is_3d_expanded(self) -> bool:
+        return self._3d_expanded
+
+    def set_3d_expanded(self, enabled: bool) -> None:
+        """Fill this workspace with 3D, preserving the camera and slice editors."""
+        if enabled == self._3d_expanded:
+            return
+        self._3d_expanded = enabled
+        for panel in self._slice_panels:
+            panel.setVisible(not enabled)
+        # Keep the native VTK window parented and alive while changing its span.
+        self._grid.removeWidget(self._vtk_panel)
+        if enabled:
+            self._grid.addWidget(self._vtk_panel, 0, 0, 2, 2)
+        else:
+            self._grid.addWidget(self._vtk_panel, 1, 1)
+        self._grid.activate()
+        self.vtk.GetRenderWindow().Render()
 
     def initialize(self) -> None:
         self.vtk.Initialize()

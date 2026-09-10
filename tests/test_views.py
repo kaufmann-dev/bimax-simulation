@@ -191,3 +191,75 @@ def test_native_four_views_mesh_transform_plane_and_pick(qapp):
     assert not widget.landmark_actors
     assert not widget.grab().isNull()
     widget.close()
+
+
+def test_expand_3d_preserves_rendering_and_slice_state(qapp):
+    doc = document()
+    widget = FourViews()
+    widget.resize(900, 700)
+    widget.show()
+    widget.initialize()
+    widget.set_document(doc)
+    widget.set_surfaces(make_surfaces(doc.anatomy, doc.geometry))
+    widget.set_crosshair(doc.geometry.index_to_world([6, 5, 4]))
+    for view in widget.slices:
+        view.set_zoom(2.5, view.content_rect().center() + QPoint(20, 15))
+    camera = widget.renderer.GetActiveCamera()
+    camera.Azimuth(23)
+    camera.Elevation(11)
+    camera.Zoom(1.3)
+    qapp.processEvents()
+    camera_state = (camera.GetPosition(), camera.GetFocalPoint(), camera.GetViewUp(), camera.GetParallelScale())
+    slice_state = [(view.crosshair.copy(), view.zoom, view._pan.copy()) for view in widget.slices]
+    slider_values = [slider.value() for slider in widget.sliders]
+    original_size = widget.vtk.size()
+    native_window = widget.vtk.GetRenderWindow()
+    actor = widget.actors[2]
+    assert not widget.is_3d_expanded
+
+    for _ in range(2):
+        widget.set_3d_expanded(True)
+        widget.set_3d_expanded(True)
+        qapp.processEvents()
+        assert widget.is_3d_expanded
+        assert all(not view.isVisible() for view in widget.slices)
+        assert all(not slider.isVisible() for slider in widget.sliders)
+        assert widget.vtk.isVisible()
+        assert widget.vtk.width() > original_size.width() * 1.8
+        assert widget.vtk.height() > original_size.height() * 1.8
+        assert widget.vtk.parentWidget().geometry() == widget.rect()
+        assert widget.vtk.GetRenderWindow() is native_window
+        assert widget.actors[2] is actor
+        assert (camera.GetPosition(), camera.GetFocalPoint(), camera.GetViewUp(), camera.GetParallelScale()) == camera_state
+
+        widget.set_3d_expanded(False)
+        widget.set_3d_expanded(False)
+        qapp.processEvents()
+        assert not widget.is_3d_expanded
+        assert all(view.isVisible() for view in widget.slices)
+        assert all(slider.isVisible() for slider in widget.sliders)
+        assert widget.vtk.size() == original_size
+        assert (camera.GetPosition(), camera.GetFocalPoint(), camera.GetViewUp(), camera.GetParallelScale()) == camera_state
+        for view, (crosshair, zoom, pan) in zip(widget.slices, slice_state, strict=True):
+            np.testing.assert_array_equal(view.crosshair, crosshair)
+            assert view.zoom == zoom
+            np.testing.assert_array_equal(view._pan, pan)
+        assert [slider.value() for slider in widget.sliders] == slider_values
+    widget.close()
+
+
+def test_expand_3d_before_loading_document(qapp):
+    widget = FourViews()
+    widget.set_3d_expanded(True)
+    widget.resize(900, 700)
+    widget.show()
+    widget.initialize()
+    widget.set_document(document())
+    qapp.processEvents()
+    assert widget.is_3d_expanded
+    assert all(not view.isVisible() for view in widget.slices)
+    assert widget.vtk.isVisible()
+    widget.set_3d_expanded(False)
+    qapp.processEvents()
+    assert all(view.isVisible() for view in widget.slices)
+    widget.close()

@@ -25,6 +25,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QScrollArea,
+    QSizePolicy,
     QSplitter,
     QTabWidget,
     QVBoxLayout,
@@ -68,6 +69,13 @@ def note(text, layout):
     return result
 
 
+def form_layout(parent=None):
+    form = QFormLayout(parent)
+    form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapLongRows)
+    form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+    return form
+
+
 def vector_inputs(form, label, callback, minimum=-10000, maximum=10000, decimals=2):
     row = QWidget()
     layout = QHBoxLayout(row)
@@ -78,12 +86,19 @@ def vector_inputs(form, label, callback, minimum=-10000, maximum=10000, decimals
         spin.setRange(minimum, maximum)
         spin.setDecimals(decimals)
         spin.setSingleStep(1 if decimals == 2 else 0.1)
+        # QDoubleSpinBox sizes itself for the widest value in its entire range.
+        # Let the three coordinate editors share the sidebar width instead.
+        spin.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+        spin.setMinimumWidth(72)
         spin.setAccessibleName(f"{label}, {axis}")
         spin.setToolTip(f"{label}: {axis} coordinate")
         spin.editingFinished.connect(callback)
         layout.addWidget(spin)
         widgets.append(spin)
-    form.addRow(label, row)
+    heading = QLabel(label)
+    heading.setWordWrap(True)
+    form.addRow(heading)
+    form.addRow(row)
     return widgets
 
 
@@ -151,6 +166,7 @@ class MainWindow(QMainWindow):
         layout.setSpacing(10)
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         scroll.setWidget(page)
         self.tabs.addTab(scroll, name)
         return layout
@@ -173,10 +189,31 @@ class MainWindow(QMainWindow):
             action.triggered.connect(callback)
             toolbar.addAction(action)
             self.toolbar_actions[name] = action
+        self.expand_3d_action = QAction("Expand 3D", self)
+        self.expand_3d_action.setCheckable(True)
+        self.expand_3d_action.setShortcut(QKeySequence("F11"))
+        self.expand_3d_action.setToolTip("Expand the 3D workspace (F11). Keep the sidebar available.")
+        self.expand_3d_action.toggled.connect(self._expand_3d)
+        toolbar.addAction(self.expand_3d_action)
+        self.restore_views_action = QAction("Restore four views", self)
+        self.restore_views_action.setShortcut(QKeySequence("Esc"))
+        self.restore_views_action.setEnabled(False)
+        self.restore_views_action.triggered.connect(lambda: self.expand_3d_action.setChecked(False))
+        self.addAction(self.restore_views_action)
         self.cancel_button = QPushButton("Cancel computation")
         self.cancel_button.clicked.connect(self.jobs.cancel)
         toolbar.addWidget(self.cancel_button)
         self.cancel_button.hide()
+
+    def _expand_3d(self, expanded):
+        self.views.set_3d_expanded(expanded)
+        self.expand_3d_action.setText("Show four views" if expanded else "Expand 3D")
+        self.expand_3d_action.setToolTip(
+            "Restore all four views (F11 or Escape)."
+            if expanded
+            else "Expand the 3D workspace (F11). Keep the sidebar available."
+        )
+        self.restore_views_action.setEnabled(expanded)
 
     def _build_import(self):
         layout = self._tab("Import")
@@ -189,7 +226,7 @@ class MainWindow(QMainWindow):
             layout,
         )
         group = QGroupBox("Head reference frame")
-        form = QFormLayout(group)
+        form = form_layout(group)
         self.frame_spins = vector_inputs(
             form, "Pitch / roll / yaw °", self._frame_changed, -180, 180
         )
@@ -212,7 +249,7 @@ class MainWindow(QMainWindow):
             "Mark the skull with upper teeth, and the mandible with lower teeth. Preview separation, then correct fused contacts in the slice views.",
             layout,
         )
-        form = QFormLayout()
+        form = form_layout()
         self.label_combo = QComboBox()
         for value, label in ANATOMY.items():
             self.label_combo.addItem(label, value)
@@ -251,7 +288,7 @@ class MainWindow(QMainWindow):
         roi_layout = QVBoxLayout(group)
         self.roi_check = QCheckBox("Limit separation to this region")
         roi_layout.addWidget(self.roi_check)
-        roi_form = QFormLayout()
+        roi_form = form_layout()
         self.roi_start = vector_inputs(roi_form, "Start XYZ", lambda: None, 0, 100000, 0)
         self.roi_end = vector_inputs(roi_form, "End XYZ", lambda: None, 0, 100000, 0)
         roi_layout.addLayout(roi_form)
@@ -272,7 +309,7 @@ class MainWindow(QMainWindow):
             "Adjust geometric cuts in the unmoved anatomy. BSSO uses a stepped split; its two proximal pieces remain fixed.",
             layout,
         )
-        form = QFormLayout()
+        form = form_layout()
         self.operation_combo = QComboBox()
         for name, key in (("Le Fort I", "lefort"), ("BSSO", "bsso"), ("Genioplasty", "genio")):
             self.operation_combo.addItem(name, key)
@@ -302,7 +339,7 @@ class MainWindow(QMainWindow):
         self.cut_preview_button = button(
             "Preview fragments", lambda: self._build_cuts(False), layout
         )
-        confirm_form = QFormLayout()
+        confirm_form = form_layout()
         self.confirm_combo = QComboBox()
         for value in (2, 3, 4, 5, 6):
             self.confirm_combo.addItem(FRAGMENTS[value], value)
@@ -319,7 +356,7 @@ class MainWindow(QMainWindow):
     def _build_move(self):
         layout = self._tab("Move")
         note("Move the jaws", layout).setStyleSheet("font-size: 18px;")
-        form = QFormLayout()
+        form = form_layout()
         self.scenario_combo = QComboBox()
         self.scenario_combo.currentTextChanged.connect(self._scenario_changed)
         form.addRow("Scenario", self.scenario_combo)
@@ -359,6 +396,11 @@ class MainWindow(QMainWindow):
         )
         self.pivot_label = note("No pivot selected.", layout)
         button("Place pivot at next pick", lambda: self._arm_pick("pivot"), layout)
+        self.reset_pivot_button = button("Reset pivot", self._reset_pivot, layout)
+        self.reset_pivot_button.setToolTip(
+            "Clear the selected control's pivot and rotation; keep its translation. "
+            "Also cancel a pending pivot pick."
+        )
         button("Use this pivot for all jaw controls", self._share_pivot, layout)
         button("Reset selected movement", self._reset_motion, layout)
         button("Duplicate scenario…", self._duplicate_scenario, layout)
@@ -425,6 +467,17 @@ class MainWindow(QMainWindow):
             self.accept_cuts_button.setEnabled(self.pending_fragments is not None)
             can_move = self.doc is not None and self.doc.fragments is not None
             self.motion_combo.setEnabled(can_move)
+            motion = self.doc.motions[self.motion_combo.currentData()] if self.doc else None
+            self.reset_pivot_button.setEnabled(
+                not busy
+                and motion is not None
+                and (
+                    motion.pivot_set
+                    or any(motion.pivot)
+                    or any(motion.angles)
+                    or self.pick_mode == "pivot"
+                )
+            )
             for i, spin in enumerate(self.motion_spins):
                 spin.setEnabled(
                     can_move
@@ -907,6 +960,7 @@ class MainWindow(QMainWindow):
         self.pick_mode = mode
         self.views.set_tool("pick")
         self._status(f"Pick a point in a slice or the 3D view to set {mode.replace('_', ' ')}.")
+        self._sync_enabled()
 
     def _fragment_selected(self, value):
         self.selected_fragment = value
@@ -1143,6 +1197,27 @@ class MainWindow(QMainWindow):
         )
         self._update_transforms()
         self._load_motion()
+
+    def _reset_pivot(self):
+        if self.doc is None or self.jobs.busy:
+            return
+        self._finish_motion_edit()
+        if self.pick_mode == "pivot":
+            self.pick_mode = None
+            self.views.set_tool("navigate")
+            self._status("Pivot pick cancelled.")
+        motion = self.doc.motions[self.motion_combo.currentData()]
+        if not (motion.pivot_set or any(motion.pivot) or any(motion.angles)):
+            self._sync_enabled()
+            return
+        before = deepcopy(self.doc.scenarios)
+        motion.pivot, motion.angles, motion.pivot_set = [0.0] * 3, [0.0] * 3, False
+        self._remember(
+            "Reset pivot", {"scenarios": before}, {"scenarios": deepcopy(self.doc.scenarios)}
+        )
+        self._load_motion()
+        self._update_transforms()
+        self._status("Pivot and rotation reset; translation retained.")
 
     def _reset_motion(self):
         if self.doc is None:

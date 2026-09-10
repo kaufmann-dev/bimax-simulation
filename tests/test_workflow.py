@@ -18,7 +18,7 @@ from bimax.engine import default_cuts
 from bimax.history import Edit, History
 from bimax.jobs import Jobs
 from bimax.model import Document, Geometry, new_scenario
-from bimax.storage import load_project
+from bimax.storage import load_project, save_project
 from bimax.surfaces import make_surfaces
 
 
@@ -218,6 +218,119 @@ def test_movement_undo_redo_retains_accepted_fragments(window, qapp):
     assert doc.motions["linked"].translation == [0, 7, 0]
     np.testing.assert_array_equal(doc.fragments, accepted)
     assert window._test_errors == []
+
+
+def test_reset_pivot_preserves_translation_other_controls_and_saved_state(window, qapp, tmp_path):
+    doc = synthetic_document(assigned=True, fragments=True)
+    selected = doc.motions["mandible"]
+    selected.translation = [2.0, 7.0, -3.0]
+    selected.angles = [12.0, 4.0, -2.0]
+    selected.pivot, selected.pivot_set = [-12.0, -10.0, 9.0], True
+    other = doc.motions["maxilla"]
+    other.translation, other.angles = [1.0, 4.0, 0.0], [3.0, 0.0, 0.0]
+    other.pivot, other.pivot_set = [-9.0, -8.0, 15.0], True
+    doc.scenarios["Alternative"] = deepcopy(doc.motions)
+    before = deepcopy(doc.scenarios)
+    accepted = doc.fragments.copy()
+    install_document(window, doc)
+    window.motion_combo.setCurrentIndex(window.motion_combo.findData("mandible"))
+    window._update_transforms()
+    assert window.views.pivot_actor.GetVisibility()
+    assert window.reset_pivot_button.isEnabled()
+
+    window.reset_pivot_button.click()
+    selected = doc.motions["mandible"]
+    assert selected.translation == [2.0, 7.0, -3.0]
+    assert selected.angles == selected.pivot == [0.0, 0.0, 0.0]
+    assert not selected.pivot_set
+    assert doc.scenarios["Alternative"] == before["Alternative"]
+    for key in ("linked", "maxilla", "chin"):
+        assert doc.motions[key] == before["Scenario 1"][key]
+    np.testing.assert_array_equal(doc.fragments, accepted)
+    assert window.dirty
+    assert [edit.name for edit in window.history.undo_stack] == ["Reset pivot"]
+    assert not window.reset_pivot_button.isEnabled()
+    assert not window.views.pivot_actor.GetVisibility()
+    assert all(view._pivot is None for view in window.views.slices)
+    assert not any(spin.isEnabled() for spin in window.motion_spins[3:])
+    assert [spin.value() for spin in window.motion_spins] == [2, 7, 3, 0, 0, 0]
+    matrix = window.views.actors[5].GetUserMatrix()
+    for row in range(3):
+        assert matrix.GetElement(row, 3) == [-2.0, -7.0, -3.0][row]
+        for column in range(3):
+            assert matrix.GetElement(row, column) == float(row == column)
+    after = deepcopy(doc.scenarios)
+
+    project = tmp_path / "reset-pivot.bimax"
+    save_project(doc, project)
+    saved = load_project(project)
+    assert saved.scenarios == after
+    np.testing.assert_array_equal(saved.fragments, accepted)
+
+    window._undo(False)
+    wait_until(qapp, lambda: not window.jobs.busy)
+    assert doc.scenarios == before
+    assert window.views.pivot_actor.GetVisibility()
+    assert all(spin.isEnabled() for spin in window.motion_spins[3:])
+    assert window.reset_pivot_button.isEnabled()
+    window._undo(True)
+    wait_until(qapp, lambda: not window.jobs.busy)
+    assert doc.scenarios == after
+    assert not window.views.pivot_actor.GetVisibility()
+    assert window._test_errors == []
+
+
+def test_reset_pivot_finishes_numeric_edit_and_cancels_pending_pick(window, qapp):
+    doc = synthetic_document(assigned=True, fragments=True)
+    motion = doc.motions["linked"]
+    motion.pivot, motion.pivot_set = [-12.0, -12.0, 12.0], True
+    install_document(window, doc)
+    window.motion_spins[1].setValue(8.5)
+    window.motion_spins[3].setValue(11.0)
+    assert window._motion_before is not None
+    edited = deepcopy(doc.scenarios)
+    window._arm_pick("pivot")
+    window.reset_pivot_button.click()
+    assert window._motion_before is None
+    assert [edit.name for edit in window.history.undo_stack] == ["Move fragment", "Reset pivot"]
+    assert window.pick_mode is None
+    assert window.views.tool == "navigate"
+    assert all(view.tool == "navigate" for view in window.views.slices)
+    window.views.pointPicked.emit([10.0, 11.0, 12.0])
+    assert not doc.motions["linked"].pivot_set
+    assert doc.motions["linked"].translation == [0.0, 8.5, 0.0]
+
+    window._undo(False)
+    wait_until(qapp, lambda: not window.jobs.busy)
+    assert doc.scenarios == edited
+    window._undo(False)
+    wait_until(qapp, lambda: not window.jobs.busy)
+    assert doc.motions["linked"].translation == [0.0, 0.0, 0.0]
+    assert doc.motions["linked"].angles == [0.0, 0.0, 0.0]
+    assert doc.motions["linked"].pivot_set
+    assert window._test_errors == []
+
+
+def test_reset_pivot_without_pivot_is_noop_but_can_cancel_armed_pick(window):
+    assert not window.reset_pivot_button.isEnabled()
+    window._reset_pivot()
+    assert not window.history.undo_stack
+    assert not window.dirty
+
+    doc = synthetic_document(assigned=True, fragments=True)
+    install_document(window, doc)
+    revision = doc.revision
+    assert not window.reset_pivot_button.isEnabled()
+    window._reset_pivot()
+    window._arm_pick("pivot")
+    assert window.reset_pivot_button.isEnabled()
+    window.reset_pivot_button.click()
+    assert window.pick_mode is None
+    assert window.views.tool == "navigate"
+    assert not window.reset_pivot_button.isEnabled()
+    assert not window.history.undo_stack
+    assert not window.dirty
+    assert doc.revision == revision
 
 
 def test_stale_worker_result_does_not_change_document_or_preview(window):
