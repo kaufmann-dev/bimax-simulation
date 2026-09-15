@@ -10,7 +10,7 @@ from uuid import uuid4
 
 import numpy as np
 from PySide6.QtCore import Qt, QTimer
-from PySide6.QtGui import QAction, QKeySequence, QStandardItemModel
+from PySide6.QtGui import QAction, QIcon, QKeySequence, QStandardItemModel
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -1678,6 +1678,11 @@ def main():
     app = QApplication(sys.argv[:1])
     app.setApplicationName("BIMAX")
     app.setDesktopFileName("bimax")
+    bundled_icon = Path(__file__).resolve().parent / "icons" / "bimax.svg"
+    fallback = QIcon(str(bundled_icon)) if bundled_icon.is_file() else QIcon()
+    icon = QIcon.fromTheme("bimax", fallback)
+    if not icon.isNull():
+        app.setWindowIcon(icon)
     app.setStyle("Fusion")
     app.setStyleSheet(STYLE)
     window = MainWindow()
