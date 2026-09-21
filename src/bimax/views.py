@@ -913,20 +913,22 @@ class FourViews(QWidget):
             side = min(window_size)
             if side <= 0:
                 raise RuntimeError("The 3D view is not ready for image export.")
-            viewport_width = side / window_size[0]
-            viewport_height = side / window_size[1]
-            self.renderer.SetViewport(
-                (1 - viewport_width) / 2,
-                (1 - viewport_height) / 2,
-                (1 + viewport_width) / 2,
-                (1 + viewport_height) / 2,
-            )
+            # Large-image capture tiles the whole window. An inset viewport
+            # repeats its black margins inside every tile, cutting bands out
+            # of the anatomy. Capture the full viewport and crop only afterward.
+            self.renderer.SetViewport(0, 0, 1, 1)
             low, high = self._visible_bounds(visible)
             magnification = max(1, -(-EXPORT_IMAGE_SIZE // side))
             rendered: list[tuple[str, QImage]] = []
             for filename, label, direction, up in EXPORT_VIEWS:
                 self._set_export_camera(
                     self._export_direction(direction), self._export_direction(up), low, high
+                )
+                # Fit a bounding sphere inside the final square crop, including
+                # portrait windows, independently of the interactive camera.
+                camera.SetParallelScale(
+                    max(float(np.linalg.norm(high - low)), 1.0) * 0.55
+                    * window_size[1] / side
                 )
                 image_filter = vtkRenderLargeImage()
                 image_filter.SetInput(self.renderer)
@@ -959,7 +961,6 @@ class FourViews(QWidget):
                 actor.SetVisibility(visible_before)
             if plane_enabled:
                 self.plane_widget.SetEnabled(True)
-            self.renderer.ResetCameraClippingRange()
             self.request_render()
         return [destination / f"{filename}.png" for filename, *_ in EXPORT_VIEWS] + [
             destination / "contact-sheet.png"

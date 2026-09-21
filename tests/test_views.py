@@ -214,14 +214,16 @@ def test_export_scenario_images_uses_standard_cameras_and_restores_scene(qapp, t
     widget.close()
 
 
-def test_export_scenario_images_renders_native_vtk_scene(qapp, tmp_path, monkeypatch):
-    monkeypatch.setattr(views, "EXPORT_IMAGE_SIZE", 192)
+@pytest.mark.parametrize("size", [(900, 700), (700, 1100)])
+def test_export_scenario_images_renders_native_vtk_scene(qapp, tmp_path, monkeypatch, size):
+    # Exercise tiled capture: the output must exceed the native viewport size.
+    monkeypatch.setattr(views, "EXPORT_IMAGE_SIZE", 2048)
     doc = document()
     doc.fragments = doc.anatomy.copy()
     doc.plan.accepted = True
     doc.fragments_key = doc.configuration_key
     widget = FourViews()
-    widget.resize(900, 700)
+    widget.resize(*size)
     widget.show()
     widget.initialize()
     widget.set_document(doc)
@@ -232,8 +234,19 @@ def test_export_scenario_images_renders_native_vtk_scene(qapp, tmp_path, monkeyp
 
     for path in exported:
         assert path.stat().st_size > 0
-    assert QImage(str(exported[0])).size().width() == 192
-    assert QImage(str(exported[-1])).size().width() == 384
+    assert QImage(str(exported[0])).size().width() == 2048
+    assert QImage(str(exported[-1])).size().width() == 4096
+    for path in exported[:4]:
+        image = QImage(str(path)).convertToFormat(QImage.Format.Format_RGB888)
+        pixels = np.asarray(image.constBits()).reshape(image.height(), image.bytesPerLine())
+        row = pixels[image.height() // 2, :image.width() * 3].reshape(-1, 3)
+        foreground = np.flatnonzero(row.max(axis=1) > 20)
+        assert foreground.size > 100
+        assert np.all(np.diff(foreground) == 1), "Solid bone has black gaps at tile boundaries"
+        column = pixels[:, :image.width() * 3].reshape(image.height(), image.width(), 3)[:, image.width() // 2]
+        foreground = np.flatnonzero(column.max(axis=1) > 20)
+        assert foreground.size > 100
+        assert np.all(np.diff(foreground) == 1), "Solid bone has horizontal tile gaps"
     widget.close()
 
 
