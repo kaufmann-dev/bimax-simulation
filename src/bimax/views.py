@@ -1,6 +1,10 @@
 """Patient-aligned slice editing and an embedded native VTK fragment viewer."""
 
+import os
+import shutil
+import tempfile
 from itertools import product
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -10,6 +14,7 @@ import vtkmodules.vtkRenderingOpenGL2  # noqa: F401
 from PySide6.QtCore import QPointF, QRectF, Qt, Signal
 from PySide6.QtGui import (
     QColor,
+    QFont,
     QImage,
     QKeyEvent,
     QMouseEvent,
@@ -21,15 +26,22 @@ from PySide6.QtGui import (
 from PySide6.QtWidgets import QGridLayout, QLabel, QSlider, QVBoxLayout, QWidget
 from scipy.ndimage import binary_dilation
 from vtkmodules.qt.QVTKRenderWindowInteractor import QVTKRenderWindowInteractor
-from vtkmodules.util.numpy_support import numpy_to_vtk
+from vtkmodules.util.numpy_support import numpy_to_vtk, vtk_to_numpy
 from vtkmodules.vtkCommonCore import vtkCommand, vtkPoints
 from vtkmodules.vtkCommonDataModel import vtkCellArray, vtkPlane, vtkPolyData
 from vtkmodules.vtkCommonMath import vtkMatrix4x4
+from vtkmodules.vtkFiltersHybrid import vtkRenderLargeImage
 from vtkmodules.vtkFiltersSources import vtkSphereSource
 from vtkmodules.vtkInteractionStyle import vtkInteractorStyleTrackballCamera
 from vtkmodules.vtkInteractionWidgets import vtkImplicitPlaneRepresentation, vtkImplicitPlaneWidget2
 from vtkmodules.vtkRenderingAnnotation import vtkCaptionActor2D
-from vtkmodules.vtkRenderingCore import vtkActor, vtkCellPicker, vtkPolyDataMapper, vtkRenderer
+from vtkmodules.vtkRenderingCore import (
+    vtkActor,
+    vtkCamera,
+    vtkCellPicker,
+    vtkPolyDataMapper,
+    vtkRenderer,
+)
 
 from bimax.model import ANATOMY_COLORS, COLORS, Document, Geometry
 from bimax.surfaces import Mesh
@@ -48,6 +60,15 @@ def sample_indices(geometry: Geometry, world: np.ndarray) -> tuple[np.ndarray, n
     safe = np.clip(xyz, 0, np.asarray(geometry.shape[::-1]) - 1)
     flat = np.ravel_multi_index(safe[..., ::-1].reshape(-1, 3).T, geometry.shape)
     return np.asarray(flat).reshape(valid.shape), valid
+
+
+EXPORT_VIEWS = (
+    ("right", "Right", np.array([1.0, 0.0, 0.0]), np.array([0.0, 0.0, 1.0])),
+    ("left", "Left", np.array([-1.0, 0.0, 0.0]), np.array([0.0, 0.0, 1.0])),
+    ("front", "Front", np.array([0.0, 1.0, 0.0]), np.array([0.0, 0.0, 1.0])),
+    ("birds-eye", "Bird's-eye", np.array([0.0, 0.0, 1.0]), np.array([0.0, 1.0, 0.0])),
+)
+EXPORT_IMAGE_SIZE = 2048
 
 
 class SliceView(QWidget):
@@ -790,6 +811,159 @@ class FourViews(QWidget):
         for label, actor in self.baseline_actors.items():
             actor.SetVisibility(visible and self._visibility[self.fragment_mode].get(label, True))
         self.request_render()
+
+    def _export_direction(self, planning_vector: np.ndarray) -> np.ndarray:
+        """Convert a planning-frame direction into a normalized LPS vector."""
+        assert self.document is not None
+        origin = self.document.plan_to_world([0, 0, 0])
+        direction = self.document.plan_to_world(planning_vector) - origin
+        return direction / np.linalg.norm(direction)
+
+    @staticmethod
+    def _visible_bounds(actors: list[vtkActor]) -> tuple[np.ndarray, np.ndarray]:
+        bounds = np.asarray([actor.GetBounds() for actor in actors], dtype=float).reshape(-1, 3, 2)
+        return bounds[:, :, 0].min(axis=0), bounds[:, :, 1].max(axis=0)
+
+    def _set_export_camera(
+        self, direction: np.ndarray, up: np.ndarray, low: np.ndarray, high: np.ndarray
+    ) -> None:
+        camera = self.renderer.GetActiveCamera()
+        center = (low + high) / 2
+        distance = max(float(np.max(high - low)), 1.0) * 2
+        camera.ParallelProjectionOn()
+        self.renderer.ResetCamera(
+            float(low[0]),
+            float(high[0]),
+            float(low[1]),
+            float(high[1]),
+            float(low[2]),
+            float(high[2]),
+        )
+        camera.SetFocalPoint(*center)
+        camera.SetPosition(*(center + direction * distance))
+        camera.SetViewUp(*up)
+        self.renderer.ResetCameraClippingRange()
+
+    @staticmethod
+    def _image_from_vtk(image: Any) -> QImage:
+        dimensions = image.GetDimensions()
+        width, height = int(dimensions[0]), int(dimensions[1])
+        scalars = image.GetPointData().GetScalars()
+        if width <= 0 or height <= 0 or scalars is None:
+            raise RuntimeError("VTK did not return an image for export.")
+        pixels = vtk_to_numpy(scalars)
+        components = int(image.GetNumberOfScalarComponents())
+        if components not in (3, 4) or pixels.size != width * height * components:
+            raise RuntimeError("VTK returned an unsupported image format for export.")
+        pixels = np.ascontiguousarray(np.flipud(pixels.reshape(height, width, components)))
+        format_ = QImage.Format.Format_RGB888 if components == 3 else QImage.Format.Format_RGBA8888
+        return QImage(pixels.data, width, height, pixels.strides[0], format_).copy()
+
+    @staticmethod
+    def _save_png(image: QImage, path: Path) -> None:
+        if image.isNull() or not image.save(str(path)):
+            raise RuntimeError(f"Could not write {path.name}.")
+
+    @staticmethod
+    def _contact_sheet(images: list[tuple[str, QImage]]) -> QImage:
+        size = EXPORT_IMAGE_SIZE
+        sheet = QImage(size * 2, size * 2, QImage.Format.Format_RGB32)
+        sheet.fill(QColor("#000000"))
+        painter = QPainter(sheet)
+        font = QFont()
+        font.setPixelSize(38)
+        font.setBold(True)
+        painter.setFont(font)
+        for index, (label, image) in enumerate(images):
+            x, y = (index % 2) * size, (index // 2) * size
+            painter.drawImage(x, y, image)
+            painter.fillRect(x + 18, y + 18, 290, 58, QColor(0, 0, 0, 190))
+            painter.setPen(QColor("#ffffff"))
+            painter.drawText(x + 32, y + 59, label)
+        painter.end()
+        return sheet
+
+    def export_scenario_images(self, output_dir: str | Path) -> list[Path]:
+        """Export four standardized moved-fragment views and a contact sheet."""
+        if self.document is None or self.document.fragments is None or not self.fragment_mode:
+            raise ValueError("Build and review the active cut plan before exporting scenario images.")
+        visible = [actor for actor in self.actors.values() if actor.GetVisibility()]
+        if not visible:
+            raise ValueError("Select at least one visible structure before exporting scenario images.")
+
+        destination = Path(output_dir).absolute()
+        if destination.is_symlink() or destination.exists():
+            raise ValueError("Image export destination must be a new folder.")
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        temporary = Path(tempfile.mkdtemp(prefix=".bimax-image-export-", dir=destination.parent))
+        camera = self.renderer.GetActiveCamera()
+        camera_before = vtkCamera()
+        camera_before.DeepCopy(camera)
+        viewport_before = self.renderer.GetViewport()
+        hidden = list(self.baseline_actors.values()) + self.landmark_actors + [self.pivot_actor]
+        visibility_before = [(actor, actor.GetVisibility()) for actor in hidden]
+        plane_enabled = bool(self.plane_widget.GetEnabled())
+        try:
+            for actor in hidden:
+                actor.SetVisibility(False)
+            if plane_enabled:
+                self.plane_widget.SetEnabled(False)
+
+            window_size = self.vtk.GetRenderWindow().GetSize()
+            side = min(window_size)
+            if side <= 0:
+                raise RuntimeError("The 3D view is not ready for image export.")
+            viewport_width = side / window_size[0]
+            viewport_height = side / window_size[1]
+            self.renderer.SetViewport(
+                (1 - viewport_width) / 2,
+                (1 - viewport_height) / 2,
+                (1 + viewport_width) / 2,
+                (1 + viewport_height) / 2,
+            )
+            low, high = self._visible_bounds(visible)
+            magnification = max(1, -(-EXPORT_IMAGE_SIZE // side))
+            rendered: list[tuple[str, QImage]] = []
+            for filename, label, direction, up in EXPORT_VIEWS:
+                self._set_export_camera(
+                    self._export_direction(direction), self._export_direction(up), low, high
+                )
+                image_filter = vtkRenderLargeImage()
+                image_filter.SetInput(self.renderer)
+                image_filter.SetMagnification(magnification)
+                image_filter.Update()
+                image = self._image_from_vtk(image_filter.GetOutput())
+                crop_size = min(image.width(), image.height())
+                image = image.copy(
+                    (image.width() - crop_size) // 2,
+                    (image.height() - crop_size) // 2,
+                    crop_size,
+                    crop_size,
+                ).scaled(
+                    EXPORT_IMAGE_SIZE,
+                    EXPORT_IMAGE_SIZE,
+                    Qt.AspectRatioMode.IgnoreAspectRatio,
+                    Qt.TransformationMode.SmoothTransformation,
+                )
+                self._save_png(image, temporary / f"{filename}.png")
+                rendered.append((label, image))
+            self._save_png(self._contact_sheet(rendered), temporary / "contact-sheet.png")
+            os.replace(temporary, destination)
+        except Exception:
+            shutil.rmtree(temporary, ignore_errors=True)
+            raise
+        finally:
+            self.renderer.SetViewport(*viewport_before)
+            camera.DeepCopy(camera_before)
+            for actor, visible_before in visibility_before:
+                actor.SetVisibility(visible_before)
+            if plane_enabled:
+                self.plane_widget.SetEnabled(True)
+            self.renderer.ResetCameraClippingRange()
+            self.request_render()
+        return [destination / f"{filename}.png" for filename, *_ in EXPORT_VIEWS] + [
+            destination / "contact-sheet.png"
+        ]
 
     def profile_view(self) -> None:
         if self.document is None:

@@ -43,3 +43,5 @@ Press **F11** to expand the 3D view and **1** for the right-profile view. Use **
 ```
 
 **Export fragment labelmaps** writes separate binary `.nii.gz` files on a shared physical grid, plus a `manifest.json` describing the fragments and transforms. Review and accept the active cut plan, and assign or explicitly exclude all bone voxels before exporting.
+
+**Export scenario images** writes right, left, front and bird's-eye PNGs plus a labeled contact sheet for the active scenario. The images use the visible moved bone surfaces and the corrected head reference frame; they do not model soft-tissue appearance.

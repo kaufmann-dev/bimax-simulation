@@ -478,6 +478,7 @@ def test_native_import_separate_cut_move_save_reopen_export(window, qapp, tmp_pa
     assert set(np.unique(window.pending_fragments)) == set(range(7))
     assert window.doc.fragments is None
     assert not window.export_button.isEnabled()
+    assert not window.image_export_button.isEnabled()
     # Acceptance runs validation in the actual computation process.
     window.accept_cuts_button.click()
     wait_until(qapp, lambda: not window.jobs.busy)
@@ -497,6 +498,7 @@ def test_native_import_separate_cut_move_save_reopen_export(window, qapp, tmp_pa
     assert window._test_errors == []
     assert window.tabs.currentIndex() == 3
     assert window.export_button.isEnabled()
+    assert window.image_export_button.isEnabled()
     assert not window.motion_spins[3].isEnabled()
 
     window._arm_pick("pivot")
@@ -535,6 +537,29 @@ def test_native_import_separate_cut_move_save_reopen_export(window, qapp, tmp_pa
     assert window._test_errors == []
     assert (tmp_path / "labelmaps" / "manifest.json").is_file()
     assert len(list((tmp_path / "labelmaps").glob("*.nii.gz"))) == 6
+
+
+def test_export_scenario_images_uses_active_scene_and_does_not_dirty_project(
+    window, tmp_path, monkeypatch
+):
+    install_document(window, synthetic_document(assigned=True, fragments=True))
+    assert window.image_export_button.isEnabled()
+    destination = tmp_path / "bimax-images"
+    expected = [destination / name for name in ("right.png", "left.png", "front.png", "birds-eye.png", "contact-sheet.png")]
+    recorded = []
+    monkeypatch.setattr(QFileDialog, "getExistingDirectory", lambda *args: str(tmp_path))
+    monkeypatch.setattr(QInputDialog, "getText", lambda *args, **kwargs: ("bimax-images", True))
+    monkeypatch.setattr(
+        window.views,
+        "export_scenario_images",
+        lambda path: recorded.append(path) or expected,
+    )
+
+    window._export_images()
+
+    assert recorded == [destination]
+    assert "Exported 5 scenario images" in window.statusBar().currentMessage()
+    assert not window.dirty
 
 
 def test_movement_undo_redo_retains_accepted_fragments(window, qapp):

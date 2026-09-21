@@ -10,7 +10,7 @@ from uuid import uuid4
 
 import numpy as np
 from PySide6.QtCore import Qt, QTimer
-from PySide6.QtGui import QAction, QIcon, QKeySequence, QStandardItemModel
+from PySide6.QtGui import QAction, QCursor, QIcon, QKeySequence, QStandardItemModel
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -450,6 +450,7 @@ class MainWindow(QMainWindow):
         button("Add measurement landmark at next pick", lambda: self._arm_pick("landmark"), layout)
         self.landmark_label = note("Landmarks show displacement from the baseline.", layout)
         button("Save project…", self.save_project, layout)
+        self.image_export_button = button("Export scenario images…", self._export_images, layout)
         self.export_button = button("Export fragment labelmaps…", self._export, layout)
         layout.addStretch()
 
@@ -504,7 +505,9 @@ class MainWindow(QMainWindow):
             self.accept_separation_button.setEnabled(self.pending_separation is not None)
             self.discard_separation_button.setEnabled(self.pending_separation is not None)
         if hasattr(self, "export_button"):
-            self.export_button.setEnabled(self.doc is not None and self.doc.fragments is not None)
+            can_export = self.doc is not None and self.doc.fragments is not None and not busy
+            self.export_button.setEnabled(can_export)
+            self.image_export_button.setEnabled(can_export)
             self.accept_cuts_button.setEnabled(self.pending_fragments is not None)
             can_move = self.doc is not None and self.doc.fragments is not None and not busy
             self.motion_combo.setEnabled(can_move)
@@ -790,6 +793,35 @@ class MainWindow(QMainWindow):
             return
         self.jobs.submit("export", self.doc, path=str(Path(parent) / name))
         self._status("Resampling positioned fragments to a shared output grid…")
+
+    def _export_images(self):
+        if self.doc is None or self.doc.fragments is None or self.jobs.busy:
+            return
+        parent = QFileDialog.getExistingDirectory(self, "Choose parent folder for scenario images")
+        if not parent:
+            return
+        name, ok = QInputDialog.getText(
+            self, "Export scenario images", "New folder name", text="bimax-images"
+        )
+        if not ok or not name:
+            return
+        if Path(name).name != name or name in (".", ".."):
+            self._error("Enter a folder name without path separators.")
+            return
+        self._status("Rendering standardized scenario views…")
+        QApplication.setOverrideCursor(QCursor(Qt.CursorShape.WaitCursor))
+        try:
+            exported = self.views.export_scenario_images(Path(parent) / name)
+        except Exception as error:
+            failure = str(error) or "Could not export scenario images."
+        else:
+            failure = ""
+        finally:
+            QApplication.restoreOverrideCursor()
+        if failure:
+            self._error(failure)
+        else:
+            self._status(f"Exported {len(exported)} scenario images to {exported[0].parent}.")
 
     def _job_finished(self, operation, revision, result):
         if operation not in ("import", "open") and self.doc is None:
