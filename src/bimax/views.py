@@ -32,7 +32,7 @@ from vtkmodules.vtkCommonDataModel import vtkCellArray, vtkPlane, vtkPolyData
 from vtkmodules.vtkCommonMath import vtkMatrix4x4
 from vtkmodules.vtkFiltersHybrid import vtkRenderLargeImage
 from vtkmodules.vtkFiltersSources import vtkSphereSource
-from vtkmodules.vtkInteractionStyle import vtkInteractorStyleTrackballCamera
+from vtkmodules.vtkInteractionStyle import vtkInteractorStyleTerrain
 from vtkmodules.vtkInteractionWidgets import vtkImplicitPlaneRepresentation, vtkImplicitPlaneWidget2
 from vtkmodules.vtkRenderingAnnotation import vtkCaptionActor2D
 from vtkmodules.vtkRenderingCore import (
@@ -66,7 +66,7 @@ EXPORT_VIEWS = (
     ("right", "Right", np.array([1.0, 0.0, 0.0]), np.array([0.0, 0.0, 1.0])),
     ("left", "Left", np.array([-1.0, 0.0, 0.0]), np.array([0.0, 0.0, 1.0])),
     ("front", "Front", np.array([0.0, 1.0, 0.0]), np.array([0.0, 0.0, 1.0])),
-    ("birds-eye", "Bird's-eye", np.array([0.0, 0.0, 1.0]), np.array([0.0, 1.0, 0.0])),
+    ("birds-eye", "Bird's-eye", np.array([0.0, np.cos(np.deg2rad(25)), np.sin(np.deg2rad(25))]), np.array([0.0, 0.0, 1.0])),
 )
 EXPORT_IMAGE_SIZE = 2048
 
@@ -525,7 +525,12 @@ class FourViews(QWidget):
         self.pivot_actor.SetVisibility(False)
         self.renderer.AddViewProp(self.pivot_actor)
         self.interactor = self.vtk.GetRenderWindow().GetInteractor()
-        self.interactor.SetInteractorStyle(vtkInteractorStyleTrackballCamera())
+        orbit = vtkInteractorStyleTerrain()
+        # Terrain orbit retains the anatomical up direction, avoiding the roll
+        # accumulated by trackball rotation. Supply its missing wheel zoom.
+        orbit.AddObserver(vtkCommand.MouseWheelForwardEvent, lambda *_: self._zoom_3d(1.21))
+        orbit.AddObserver(vtkCommand.MouseWheelBackwardEvent, lambda *_: self._zoom_3d(1 / 1.21))
+        self.interactor.SetInteractorStyle(orbit)
         self.interactor.AddObserver(vtkCommand.LeftButtonPressEvent, self._pick_3d, 1.0)
         self.plane_rep = vtkImplicitPlaneRepresentation()
         self.plane_rep.SetPlaceFactor(1.1)
@@ -566,6 +571,15 @@ class FourViews(QWidget):
         # QVTK's paintEvent renders the native scene. A separate render timer
         # would draw it again when the queued Qt paint is subsequently handled.
         self.vtk.update()
+
+    def _zoom_3d(self, factor: float) -> None:
+        camera = self.renderer.GetActiveCamera()
+        if camera.GetParallelProjection():
+            camera.SetParallelScale(camera.GetParallelScale() / factor)
+        else:
+            camera.Dolly(factor)
+        self.renderer.ResetCameraClippingRange()
+        self.request_render()
 
     @staticmethod
     def _make_caption(name: str, color: tuple[float, float, float]) -> vtkCaptionActor2D:

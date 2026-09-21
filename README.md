@@ -34,6 +34,8 @@ Scenarios can share a cut plan. Create an independent cut plan when you want to 
 
 Press **F11** to expand the 3D view and **1** for the right-profile view. Use **Ctrl+Z** to undo and **Ctrl+Shift+Z** to redo edits.
 
+Drag in the 3D view to orbit while keeping the head upright. Middle-drag pans and the mouse wheel zooms.
+
 ## Save and export
 
 **Save** (`Ctrl+S`) stores the volume, anatomy edits, cut plans, and scenarios in a portable `.bimax` project. Reopen it with **Open project** or:
@@ -44,4 +46,4 @@ Press **F11** to expand the 3D view and **1** for the right-profile view. Use **
 
 **Export fragment labelmaps** writes separate binary `.nii.gz` files on a shared physical grid, plus a `manifest.json` describing the fragments and transforms. Review and accept the active cut plan, and assign or explicitly exclude all bone voxels before exporting.
 
-**Export scenario images** writes right, left, front and bird's-eye PNGs plus a labeled contact sheet for the active scenario. The images use the visible moved bone surfaces and the corrected head reference frame; they do not model soft-tissue appearance.
+**Export scenario images** writes right, left, front and bird's-eye PNGs plus a labeled contact sheet for the active scenario. Bird's-eye looks down toward the face from 25° above the front. The images use the visible moved bone surfaces and the corrected head reference frame; they do not model soft-tissue appearance.

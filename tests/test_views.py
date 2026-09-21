@@ -130,6 +130,50 @@ def test_mesh_install_reuses_geometry_and_coalesces_native_renders(qapp):
     assert not renders, "A queued update must not render a closed native window"
 
 
+def test_circular_orbit_keeps_head_upright_and_supports_pan_zoom(qapp):
+    widget = FourViews()
+    widget.resize(900, 700)
+    widget.show()
+    widget.initialize()
+    qapp.processEvents()
+    camera = widget.renderer.GetActiveCamera()
+    up = np.array([0, 0.6, 0.8])
+    position = np.array([0, -8, 6])
+    camera.SetPosition(*position)
+    camera.SetFocalPoint(0, 0, 0)
+    camera.SetViewUp(*up)
+    camera.ParallelProjectionOn()
+    interactor = widget.interactor
+    interactor.SetEventPosition(200, 160)
+    interactor.InvokeEvent("LeftButtonPressEvent")
+    for x, y in [(230, 160), (230, 190), (200, 190), (200, 160)] * 8:
+        interactor.SetEventPosition(x, y)
+        interactor.InvokeEvent("MouseMoveEvent")
+    interactor.InvokeEvent("LeftButtonReleaseEvent")
+    np.testing.assert_allclose(camera.GetViewUp(), up, atol=1e-10)
+    np.testing.assert_allclose(camera.GetPosition(), position, atol=1e-10)
+    scale = camera.GetParallelScale()
+    interactor.InvokeEvent("MouseWheelForwardEvent")
+    assert camera.GetParallelScale() < scale
+    interactor.InvokeEvent("MouseWheelBackwardEvent")
+    assert camera.GetParallelScale() == pytest.approx(scale)
+    interactor.InvokeEvent("MiddleButtonPressEvent")
+    interactor.SetEventPosition(220, 180)
+    interactor.InvokeEvent("MouseMoveEvent")
+    interactor.InvokeEvent("MiddleButtonReleaseEvent")
+    assert np.linalg.norm(camera.GetFocalPoint()) > 0
+    np.testing.assert_allclose(camera.GetViewUp(), up)
+    widget.close()
+
+
+def test_birds_eye_is_elevated_front():
+    _, _, direction, up = views.EXPORT_VIEWS[3]
+    assert direction[0] == 0
+    assert direction[1] > 0
+    assert np.degrees(np.arctan2(direction[2], direction[1])) == pytest.approx(25)
+    np.testing.assert_array_equal(up, [0, 0, 1])
+
+
 def test_export_scenario_images_uses_standard_cameras_and_restores_scene(qapp, tmp_path, monkeypatch):
     class FakeRenderLargeImage:
         cameras = []
