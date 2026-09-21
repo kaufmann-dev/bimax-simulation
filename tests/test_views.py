@@ -170,7 +170,7 @@ def test_birds_eye_is_elevated_front():
     _, _, direction, up = views.EXPORT_VIEWS[3]
     assert direction[0] == 0
     assert direction[1] > 0
-    assert np.degrees(np.arctan2(direction[2], direction[1])) == pytest.approx(25)
+    assert np.degrees(np.arctan2(direction[2], direction[1])) == pytest.approx(40)
     np.testing.assert_array_equal(up, [0, 0, 1])
 
 

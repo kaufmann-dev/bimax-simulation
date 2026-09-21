@@ -66,7 +66,7 @@ EXPORT_VIEWS = (
     ("right", "Right", np.array([1.0, 0.0, 0.0]), np.array([0.0, 0.0, 1.0])),
     ("left", "Left", np.array([-1.0, 0.0, 0.0]), np.array([0.0, 0.0, 1.0])),
     ("front", "Front", np.array([0.0, 1.0, 0.0]), np.array([0.0, 0.0, 1.0])),
-    ("birds-eye", "Bird's-eye", np.array([0.0, np.cos(np.deg2rad(25)), np.sin(np.deg2rad(25))]), np.array([0.0, 0.0, 1.0])),
+    ("birds-eye", "Bird's-eye", np.array([0.0, np.cos(np.deg2rad(40)), np.sin(np.deg2rad(40))]), np.array([0.0, 0.0, 1.0])),
 )
 EXPORT_IMAGE_SIZE = 2048
 
