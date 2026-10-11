@@ -1,9 +1,0 @@
-[Desktop Entry]
-Type=Application
-Name=BIMAX
-Comment=Explore jaw movements from a binary bone volume
-Exec=bimax %f
-Icon=bimax
-Terminal=false
-Categories=Graphics;Science;
-StartupWMClass=bimax

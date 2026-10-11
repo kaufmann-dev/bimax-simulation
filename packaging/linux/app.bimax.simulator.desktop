@@ -1,0 +1,15 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=BIMAX
+GenericName=Jaw Movement Simulator
+Comment=Explore jaw movements from a binary bone volume
+Exec=bimax %f
+TryExec=bimax
+Icon=app.bimax.simulator
+Terminal=false
+Categories=Science;MedicalSoftware;
+Keywords=jaw;orthognathic;osteotomy;NIfTI;volume;
+MimeType=application/x-bimax;
+StartupNotify=true
+StartupWMClass=bimax

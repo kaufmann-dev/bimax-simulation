@@ -1709,10 +1709,10 @@ def main():
     os.environ.setdefault("QT_QPA_PLATFORM", "xcb")
     app = QApplication(sys.argv[:1])
     app.setApplicationName("BIMAX")
-    app.setDesktopFileName("bimax")
+    app.setDesktopFileName("app.bimax.simulator")
     bundled_icon = Path(__file__).resolve().parent / "icons" / "bimax.svg"
     fallback = QIcon(str(bundled_icon)) if bundled_icon.is_file() else QIcon()
-    icon = QIcon.fromTheme("bimax", fallback)
+    icon = QIcon.fromTheme("app.bimax.simulator", fallback)
     if not icon.isNull():
         app.setWindowIcon(icon)
     app.setStyle("Fusion")
