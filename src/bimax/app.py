@@ -237,7 +237,7 @@ class MainWindow(QMainWindow):
         self.restore_views_action.setEnabled(expanded)
 
     def _build_import(self):
-        layout = self._tab("Import")
+        layout = self._tab("Orient")
         note("BIMAX", layout).setStyleSheet("font-size: 24px; font-weight: 600;")
         note("Explore bone movement using an unsegmented binary bone volume.", layout)
         button("Import binary NIfTI…", self.import_volume, layout)
@@ -246,6 +246,17 @@ class MainWindow(QMainWindow):
             "Input: one 3D .nii or .nii.gz file with values 0 and 1. Prepare the bone volume with medsurface before import.",
             layout,
         )
+        group = QGroupBox("Whole-skull orientation")
+        form = form_layout(group)
+        self.orientation_spins = vector_inputs(
+            form, "Pitch / roll / yaw °", self._orientation_changed, -180, 180
+        )
+        for spin, axis in zip(self.orientation_spins, ("Pitch", "Roll", "Yaw"), strict=True):
+            spin.setAccessibleName(f"Whole-skull {axis.lower()} in degrees")
+            spin.setToolTip(f"{axis} in degrees")
+        layout.addWidget(group)
+        note("Align the whole skull for viewing and image export. This orientation is shared by all scenarios.", layout)
+        button("Reset orientation", self._reset_orientation, layout)
         group = QGroupBox("Head reference frame")
         form = form_layout(group)
         self.frame_spins = vector_inputs(
@@ -479,6 +490,8 @@ class MainWindow(QMainWindow):
     def _sync_enabled(self):
         has_doc = self.doc is not None
         busy = self.jobs.busy
+        for spin in self.orientation_spins:
+            spin.setEnabled(has_doc and not busy)
         for name, action in (
             self.toolbar_actions.items() if hasattr(self, "toolbar_actions") else []
         ):
@@ -800,9 +813,7 @@ class MainWindow(QMainWindow):
             self.views.set_label(self.label_combo.currentData())
             self.views.set_brush_mm(self.brush_spin.value())
             self._load_document_controls()
-            self.tabs.setCurrentIndex(
-                1 if operation == "import" else (3 if self.doc.fragments is not None else 1)
-            )
+            self.tabs.setCurrentIndex(0)
             self.setWindowTitle(f"BIMAX — {self.doc.source_name}" + (" *" if self.dirty else ""))
             self._status("Volume ready. Source voxels and physical geometry are preserved.")
         elif operation == "separate":
@@ -887,6 +898,8 @@ class MainWindow(QMainWindow):
         angles = Rotation.from_matrix(rotation).as_euler("xyz", degrees=True)
         for spin, value in zip(self.frame_spins, angles, strict=True):
             spin.setValue(float(value))
+        for spin, value in zip(self.orientation_spins, self.doc.view_angles, strict=True):
+            spin.setValue(value)
         self.loading = False
         self._load_cut_controls()
         self._load_motion()
@@ -1361,6 +1374,24 @@ class MainWindow(QMainWindow):
             self.pick_mode = None
             self.views.set_tool("navigate")
 
+    def _orientation_changed(self):
+        if self.loading or self.doc is None or self.jobs.busy:
+            return
+        angles = [spin.value() for spin in self.orientation_spins]
+        if angles == self.doc.view_angles:
+            return
+        before = list(self.doc.view_angles)
+        self.doc.view_angles = angles
+        self._remember("Orient whole skull", {"view_angles": before}, {"view_angles": angles})
+        self.views.profile_view()
+
+    def _reset_orientation(self):
+        if self.doc is None or self.jobs.busy:
+            return
+        for spin in self.orientation_spins:
+            spin.setValue(0)
+        self._orientation_changed()
+
     def _frame_changed(self):
         if self.loading or self.doc is None:
             return
@@ -1576,6 +1607,12 @@ class MainWindow(QMainWindow):
             patch[0] == "anatomy" for patch in edit.patches
         )
         if self.history.apply(self.doc, forward):
+            if "view_angles" in edit.before:
+                self._mark_dirty()
+                self._load_document_controls()
+                self.views.profile_view()
+                self._sync_enabled()
+                return
             if anatomy_changed:
                 self._loaded_meshes.pop(False, None)
                 if "anatomy" in edit.before:

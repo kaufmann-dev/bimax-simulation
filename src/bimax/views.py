@@ -830,7 +830,10 @@ class FourViews(QWidget):
         """Convert a planning-frame direction into a normalized LPS vector."""
         assert self.document is not None
         origin = self.document.plan_to_world([0, 0, 0])
-        direction = self.document.plan_to_world(planning_vector) - origin
+        from scipy.spatial.transform import Rotation
+
+        rotation = Rotation.from_euler("xyz", self.document.view_angles, degrees=True)
+        direction = self.document.plan_to_world(rotation.inv().apply(planning_vector)) - origin
         return direction / np.linalg.norm(direction)
 
     @staticmethod
@@ -989,9 +992,8 @@ class FourViews(QWidget):
         # is up, including after the user corrects the head orientation.
         camera = self.renderer.GetActiveCamera()
         camera.SetFocalPoint(*center)
-        world_origin = self.document.plan_to_world([0, 0, 0])
-        right = self.document.plan_to_world([1, 0, 0]) - world_origin
-        superior = self.document.plan_to_world([0, 0, 1]) - world_origin
+        right = self._export_direction(np.asarray([1, 0, 0]))
+        superior = self._export_direction(np.asarray([0, 0, 1]))
         camera.SetPosition(*(center + right * max(high - low) * 2))
         camera.SetViewUp(*superior)
         camera.ParallelProjectionOn()

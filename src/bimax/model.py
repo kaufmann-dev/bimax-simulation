@@ -131,6 +131,7 @@ class Document:
     fragments: np.ndarray | None = None
     fragments_key: str | None = None
     frame: np.ndarray = field(default_factory=lambda: np.diag([-1.0, -1.0, 1.0, 1.0]))
+    view_angles: list[float] = field(default_factory=lambda: [0.0, 0.0, 0.0])
     cuts: dict[str, Cut] = field(default_factory=dict)
     scenarios: dict[str, Scenario] = field(default_factory=lambda: {"Scenario 1": new_scenario()})
     active_scenario: str = "Scenario 1"

@@ -67,7 +67,7 @@ bimax /path/to/bone.nii.gz
 
 ## Create a simulation
 
-1. **Import** your bone mask and adjust the head reference frame before placing cuts or movement pivots.
+1. **Orient**: import your bone mask, then align the whole skull with pitch, roll, and yaw. This saved view orientation applies to all scenarios and standardized image exports without changing cuts, movements, or prepared geometry. The separate head reference frame defines movement axes and must be set before placing cuts or movement pivots.
 2. **Separate** the skull and upper teeth from the mandible and lower teeth. Paint seeds, preview the separation, correct fused contacts with assignment or barrier tools, then accept it.
 3. **Cut** by selecting shared cuts for the active scenario. Edit each cut’s planes once, preview the combination, confirm any new pieces, and accept it. Cut edits affect every scenario using that cut.
 4. **Move** the jaws together or adjust each upper-jaw fragment, distal mandible, and chin individually. Set pivots, translations, and rotations; duplicate scenarios to compare alternatives. The BSSO proximal pieces remain fixed.
@@ -88,7 +88,7 @@ Drag in the 3D view to orbit while keeping the head upright. Middle-drag pans an
 bimax /path/to/simulation.bimax
 ```
 
-Projects use `.bimax` format version 3. Older formats require a one-time conversion; they are not loaded by this version.
+Projects use `.bimax` format version 4. Older formats require a one-time conversion; they are not loaded by this version.
 
 **Export fragment labelmaps** writes separate binary `.nii.gz` files on a shared physical grid, plus a `manifest.json` describing the fragments and transforms. Review and accept the active cut combination, and assign or explicitly exclude all bone voxels before exporting.
 

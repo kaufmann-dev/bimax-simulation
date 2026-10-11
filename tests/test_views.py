@@ -174,7 +174,8 @@ def test_birds_eye_is_elevated_front():
     np.testing.assert_array_equal(up, [0, 0, 1])
 
 
-def test_export_scenario_images_uses_standard_cameras_and_restores_scene(qapp, tmp_path, monkeypatch):
+@pytest.mark.parametrize("orientation", [[0.0, 0.0, 0.0], [17.0, -9.0, 23.0]])
+def test_export_scenario_images_uses_standard_cameras_and_restores_scene(qapp, tmp_path, monkeypatch, orientation):
     class FakeRenderLargeImage:
         cameras = []
 
@@ -201,6 +202,7 @@ def test_export_scenario_images_uses_standard_cameras_and_restores_scene(qapp, t
     monkeypatch.setattr(views, "EXPORT_IMAGE_SIZE", 96)
     monkeypatch.setattr(views, "vtkRenderLargeImage", FakeRenderLargeImage)
     doc = document()
+    doc.view_angles = orientation
     doc.fragments = doc.anatomy.copy()
     doc.accept_review()
     doc.fragments_key = doc.configuration_key
@@ -237,12 +239,15 @@ def test_export_scenario_images_uses_standard_cameras_and_restores_scene(qapp, t
     directions = [entry[0] for entry in FakeRenderLargeImage.cameras]
     ups = [entry[1] / np.linalg.norm(entry[1]) for entry in FakeRenderLargeImage.cameras]
     origin = doc.plan_to_world([0, 0, 0])
+    from scipy.spatial.transform import Rotation
+
+    inverse = Rotation.from_euler("xyz", orientation, degrees=True).inv()
     expected_directions = [
-        (doc.plan_to_world(direction) - origin) / np.linalg.norm(doc.plan_to_world(direction) - origin)
+        (doc.plan_to_world(inverse.apply(direction)) - origin) / np.linalg.norm(doc.plan_to_world(inverse.apply(direction)) - origin)
         for _, _, direction, _ in views.EXPORT_VIEWS
     ]
     expected_ups = [
-        (doc.plan_to_world(up) - origin) / np.linalg.norm(doc.plan_to_world(up) - origin)
+        (doc.plan_to_world(inverse.apply(up)) - origin) / np.linalg.norm(doc.plan_to_world(inverse.apply(up)) - origin)
         for _, _, _, up in views.EXPORT_VIEWS
     ]
     np.testing.assert_allclose(directions, expected_directions)

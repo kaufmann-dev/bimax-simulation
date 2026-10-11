@@ -66,6 +66,7 @@ def phantom(reflected=False):
 @pytest.mark.parametrize("reflected", [False, True])
 def test_project_roundtrip_preserves_shared_anatomy_plans_and_scenarios(tmp_path, reflected):
     doc = phantom(reflected)
+    doc.view_angles = [7.5, -3.0, 2.0]
     doc.seeds[2, 3, 2] = 2
     doc.barriers[2, 3, 3] = 1
     for level in (2, 3):
@@ -103,7 +104,8 @@ def test_project_roundtrip_preserves_shared_anatomy_plans_and_scenarios(tmp_path
             "project.json", "volumes/source.nii.gz", "volumes/anatomy.nii.gz",
             "volumes/seeds.nii.gz", "volumes/barriers.nii.gz",
         }
-        assert json.loads(archive.read("project.json"))["version"] == 3
+        assert json.loads(archive.read("project.json"))["version"] == 4
+    assert restored.view_angles == [7.5, -3.0, 2.0]
     restored.motions["linked"].translation[0] = 100
     restored.scenario.landmarks[0]["point"][0] = 100
     assert restored.scenarios["Scenario 1"].motions["linked"].translation == [0.0, 0.0, 0.0]
@@ -202,7 +204,7 @@ def test_version_one_rejection_explains_new_format(tmp_path):
     path = tmp_path / "old.bimax"
     save_project(phantom(), path)
     rewrite_archive(path, lambda metadata: metadata.__setitem__("version", 1))
-    with pytest.raises(ValueError, match="version 3 project"):
+    with pytest.raises(ValueError, match="version 4 project"):
         load_project(path)
 
 

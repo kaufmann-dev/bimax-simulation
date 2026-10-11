@@ -29,7 +29,7 @@ from bimax.model import (
     new_motions,
 )
 
-_VERSION = 3
+_VERSION = 4
 _MAX_METADATA = 8 * 1024 * 1024
 _MAX_VOXELS = 2**31 - 1
 _VOLUMES = ("source", "anatomy", "seeds", "barriers")
@@ -122,6 +122,7 @@ def _confirmations(value: Any, allowed: set[str]) -> None:
 def _metadata(doc: Document) -> dict[str, Any]:
     return {"format": "bimax", "version": _VERSION, "geometry": asdict(doc.geometry),
             "frame": np.asarray(doc.frame).tolist(),
+            "view_angles": list(doc.view_angles),
             "cuts": {key: asdict(cut) for key, cut in doc.cuts.items()},
             "scenarios": {name: asdict(scenario) for name, scenario in doc.scenarios.items()},
             "reviews": {key: asdict(review) for key, review in doc.reviews.items()},
@@ -132,11 +133,14 @@ def _metadata(doc: Document) -> dict[str, Any]:
 
 def _validated_metadata(value: Any) -> tuple[Geometry, dict[str, Cut], dict[str, Scenario], dict[str, Review]]:
     if not isinstance(value, dict) or value.get("format") != "bimax" or value.get("version") != _VERSION:
-        raise ValueError("Open a version 3 project with shared cuts; older project formats require a one-time conversion.")
-    if set(value) != {"format", "version", "geometry", "frame", "cuts", "scenarios", "reviews", "artifacts",
+        raise ValueError("Open a version 4 project with saved orientation; older project formats require a one-time conversion.")
+    if set(value) != {"format", "version", "geometry", "frame", "view_angles", "cuts", "scenarios", "reviews", "artifacts",
                       "active_scenario", "anatomy_revision", "source_name", "revision", "volumes"}:
         raise ValueError("Project metadata is incomplete or unsupported.")
     geometry = _geometry(value["geometry"])
+    _vector(value["view_angles"], 3, "Whole-skull orientation")
+    if any(abs(angle) > 180 for angle in value["view_angles"]):
+        raise ValueError("Whole-skull orientation must be between -180 and 180 degrees.")
     frame = np.asarray(value["frame"])
     if (frame.shape != (4, 4) or frame.dtype.kind not in "iuf" or not np.all(np.isfinite(frame))
             or not np.allclose(frame[3], [0, 0, 0, 1])
@@ -362,7 +366,7 @@ def save_project(doc: Document, path: str | Path) -> None:
 
 
 def load_project(path: str | Path) -> Document:
-    """Load version 3 only; restore portable artifacts to the private local cache."""
+    """Load version 4 only; restore portable artifacts to the private local cache."""
     from bimax.prepared import MAX_ARTIFACT_BYTES, artifact_path, file_digest
 
     try:
@@ -418,6 +422,7 @@ def load_project(path: str | Path) -> Document:
             doc = Document(geometry=geometry, source=arrays["source"], anatomy=arrays["anatomy"],
                            seeds=arrays["seeds"], barriers=arrays["barriers"],
                            frame=np.asarray(metadata["frame"], dtype=float), cuts=cuts, scenarios=scenarios,
+                           view_angles=list(metadata["view_angles"]),
                            reviews=reviews, artifacts=refs, active_scenario=metadata["active_scenario"],
                            anatomy_revision=metadata["anatomy_revision"], source_name=metadata["source_name"],
                            revision=metadata["revision"])

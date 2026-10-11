@@ -542,6 +542,7 @@ def test_reset_pivot_preserves_translation_other_controls_and_saved_state(window
     before = deepcopy(doc.scenarios)
     accepted = doc.fragments.copy()
     install_document(window, doc)
+    window.tabs.setCurrentIndex(3)
     window.motion_combo.setCurrentIndex(window.motion_combo.findData("mandible"))
     window._update_transforms()
     assert window.views.pivot_actor.GetVisibility()
@@ -660,6 +661,7 @@ def test_stale_worker_result_does_not_change_document_or_preview(window):
 def test_editing_stages_display_baseline_geometry_after_movement(window, stage):
     doc = synthetic_document(assigned=True, fragments=True)
     install_document(window, doc)
+    window.tabs.setCurrentIndex(3)
     window.motion_spins[1].setValue(7)
     window.motion_spins[1].editingFinished.emit()
     assert window.views.actors[5].GetUserMatrix().GetElement(1, 3) == -7
@@ -944,3 +946,35 @@ def test_anatomy_painting_defers_full_fingerprint_to_the_worker(window, monkeypa
     assert doc.fragments is None
     assert not doc.cuts_accepted
     window._remesh_timer.stop()
+
+
+def test_orientation_first_step_preserves_geometry_and_supports_undo(window, monkeypatch):
+    doc = synthetic_document(assigned=True, fragments=True)
+    install_document(window, doc)
+    assert window.tabs.tabText(0) == "Orient"
+    assert window.tabs.currentIndex() == 0
+    key = doc.configuration_key
+    fragments = doc.fragments
+    cuts = deepcopy(doc.cuts)
+    scenarios = deepcopy(doc.scenarios)
+    frame = doc.frame.copy()
+    def no_computation(*args, **kwargs):
+        raise AssertionError("Orientation must not launch a computation")
+    monkeypatch.setattr(window.jobs, "submit", no_computation)
+    window.orientation_spins[0].setValue(15)
+    window._orientation_changed()
+    assert doc.view_angles == [15, 0, 0]
+    assert doc.configuration_key == key
+    assert doc.fragments is fragments
+    assert doc.cuts == cuts
+    assert doc.scenarios == scenarios
+    np.testing.assert_array_equal(doc.frame, frame)
+    camera = window.views.renderer.GetActiveCamera()
+    np.testing.assert_allclose(camera.GetViewUp(), [0, -np.sin(np.deg2rad(15)), np.cos(np.deg2rad(15))])
+    window._undo(False)
+    assert doc.view_angles == [0, 0, 0]
+    assert doc.fragments is fragments
+    window._undo(True)
+    assert doc.view_angles == [15, 0, 0]
+    window._reset_orientation()
+    assert doc.view_angles == [0, 0, 0]
