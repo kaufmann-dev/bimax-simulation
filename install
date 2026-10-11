@@ -98,11 +98,10 @@ readonly work_dir
 trap 'rm -rf -- "$work_dir"' EXIT
 
 if [[ -z "$source_root" ]]; then
-    latest_url="$(curl -fsSLI -o /dev/null -w '%{url_effective}' \
-        "https://github.com/$repository/releases/latest")"
-    release_tag="${latest_url##*/}"
+    release_json="$(curl -fsSL "https://api.github.com/repos/$repository/releases/latest")"
+    release_tag="$(sed -n 's/^ *"tag_name": *"\([^"]*\)".*/\1/p' <<<"$release_json" | head -n 1)"
     if [[ "$release_tag" != v* ]]; then
-        printf 'Could not find the latest BIMAX release at %s.\n' "$latest_url" >&2
+        printf 'Could not find the latest BIMAX release of %s.\n' "$repository" >&2
         exit 1
     fi
     printf 'Downloading BIMAX %s...\n' "$release_tag"
