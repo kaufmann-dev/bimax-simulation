@@ -1,0 +1,48 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Publish GitHub release
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+
+      - name: Check release version consistency
+        run: |
+          project_version="$(awk -F '"' '/^version = "/ { print $2; exit }' pyproject.toml)"
+          metainfo_version="$(grep -oP '<release version="\K[^"]+' packaging/linux/app.bimax.simulator.metainfo.xml | head -n 1)"
+          printf 'pyproject %s, AppStream %s, tag %s\n' "$project_version" "$metainfo_version" "$GITHUB_REF_NAME"
+          test -n "$project_version"
+          test "$project_version" = "$metainfo_version"
+          test "$GITHUB_REF_NAME" = "v$project_version"
+
+      - name: Publish release
+        env:
+          GH_REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          notes="$(cat <<'NOTES'
+          ## Install
+
+          Install [uv](https://docs.astral.sh/uv/getting-started/installation/) (`sudo dnf install uv` on Fedora), then run:
+
+          ```sh
+          curl -fsSL https://raw.githubusercontent.com/kaufmann-dev/bimax-simulation/main/install | bash
+          ```
+          NOTES
+          )"
+          gh release create "$GITHUB_REF_NAME" \
+            --title "BIMAX $GITHUB_REF_NAME" \
+            --notes "$notes" \
+            --generate-notes \
+            --verify-tag

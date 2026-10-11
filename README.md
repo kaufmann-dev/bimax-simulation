@@ -4,25 +4,23 @@ Explore jaw movements in 3D from a binary bone volume. BIMAX is a Linux desktop 
 
 It supports Le Fort I, II and III cut plans, bilateral sagittal split osteotomy (BSSO), and genioplasty. This is a geometric simulation: it does not predict fractures, bite, or soft-tissue behavior.
 
-## Install for your user
+## Install
 
 You need Linux with a graphical desktop. BIMAX uses Qt's X11 backend, so an X11 session or XWayland is required. The installer places BIMAX below `~/.local` and does not need `sudo`.
 
 On Fedora, install the prerequisites once:
 
 ```sh
-sudo dnf install desktop-file-utils git-core gtk-update-icon-cache shared-mime-info uv
+sudo dnf install curl desktop-file-utils gtk-update-icon-cache shared-mime-info tar uv
 ```
 
-Clone the project, then install or replace the current user copy:
+Install or update to the latest release:
 
 ```sh
-git clone https://github.com/kaufmann-dev/bimax-simulation.git
-cd bimax-simulation
-./install
+curl -fsSL https://raw.githubusercontent.com/kaufmann-dev/bimax-simulation/main/install | bash
 ```
 
-The installer downloads Python 3.12 if needed, installs BIMAX into its own environment with the versions pinned in `uv.lock`, and adds the `bimax` command, application launcher, icon, AppStream metadata, and `.bimax` file association. The checkout is not needed at runtime. For a later update, pull the desired source revision and run `./install` again. Confirm that the user copy wins:
+The installer downloads Python 3.12 if needed, installs BIMAX into its own environment with the versions pinned in `uv.lock`, and adds the `bimax` command, application launcher, icon, AppStream metadata, and `.bimax` file association. Run the same command again to update after a new release. Confirm that the user copy wins:
 
 ```sh
 command -v bimax
@@ -35,10 +33,20 @@ If the installer warns that `~/.local/bin` is not first in `PATH`, add it to you
 export PATH="$HOME/.local/bin:$PATH"
 ```
 
-To remove the command, launcher, icon, metadata, and file association, run:
+To remove the command, launcher, icon, metadata, and file association:
 
 ```sh
-./install --uninstall
+curl -fsSL https://raw.githubusercontent.com/kaufmann-dev/bimax-simulation/main/install | bash -s -- --uninstall
+```
+
+### Install from a checkout
+
+To install a specific source revision instead, run the installer from a clone. It installs that checkout rather than the latest release, and `./install --uninstall` removes it:
+
+```sh
+git clone https://github.com/kaufmann-dev/bimax-simulation.git
+cd bimax-simulation
+./install
 ```
 
 ## Start BIMAX
@@ -90,3 +98,14 @@ From a checkout, run the current source without installing it:
 uv sync --frozen
 uv run bimax
 ```
+
+## Publish a release
+
+Set the new version in `pyproject.toml` and the first `<release>` in `packaging/linux/app.bimax.simulator.metainfo.xml`. After the commit is on `main`, tag and push it:
+
+```sh
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+The Release workflow verifies that the tag matches both versions and publishes a GitHub release. The piped installer always installs the latest release.

@@ -2,11 +2,11 @@
 
 set -euo pipefail
 
-repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-readonly repo_root
+readonly repository="kaufmann-dev/bimax-simulation"
 
 usage() {
-    printf 'Usage: %s [--uninstall]\n' "$0"
+    printf 'Usage: install [--uninstall]\n'
+    printf 'Run from a checkout to install that source, or pipe from GitHub to install the latest release.\n'
 }
 
 action=install
@@ -32,6 +32,13 @@ if [[ -z "${HOME:-}" ]]; then
     exit 1
 fi
 
+# A checkout installs its own source; a piped script downloads the latest release.
+source_root=""
+script_path="${BASH_SOURCE[0]:-}"
+if [[ -n "$script_path" && -f "$script_path" ]]; then
+    source_root="$(cd -- "$(dirname -- "$script_path")" && pwd)"
+fi
+
 install_hint() {
     case "$1" in
         desktop-file-install | update-desktop-database) printf 'sudo dnf install desktop-file-utils' ;;
@@ -40,12 +47,17 @@ install_hint() {
     esac
 }
 
-for command_name in \
-    uv \
-    desktop-file-install \
-    gtk-update-icon-cache \
-    update-desktop-database \
-    update-mime-database; do
+required_commands=(
+    uv
+    desktop-file-install
+    gtk-update-icon-cache
+    update-desktop-database
+    update-mime-database
+)
+if [[ "$action" == install && -z "$source_root" ]]; then
+    required_commands+=(curl tar)
+fi
+for command_name in "${required_commands[@]}"; do
     if ! command -v "$command_name" >/dev/null 2>&1; then
         printf 'Required command not found: %s\n' "$command_name" >&2
         printf 'On Fedora: %s\n' "$(install_hint "$command_name")" >&2
@@ -81,26 +93,44 @@ if [[ "$action" == uninstall ]]; then
     exit 0
 fi
 
-constraints="$(mktemp)"
-trap 'rm -f "$constraints"' EXIT
+work_dir="$(mktemp -d)"
+readonly work_dir
+trap 'rm -rf -- "$work_dir"' EXIT
+
+if [[ -z "$source_root" ]]; then
+    latest_url="$(curl -fsSLI -o /dev/null -w '%{url_effective}' \
+        "https://github.com/$repository/releases/latest")"
+    release_tag="${latest_url##*/}"
+    if [[ "$release_tag" != v* ]]; then
+        printf 'Could not find the latest BIMAX release at %s.\n' "$latest_url" >&2
+        exit 1
+    fi
+    printf 'Downloading BIMAX %s...\n' "$release_tag"
+    source_root="$work_dir/source"
+    mkdir -p "$source_root"
+    curl -fsSL "https://github.com/$repository/archive/refs/tags/$release_tag.tar.gz" |
+        tar -xz -C "$source_root" --strip-components=1
+fi
+readonly source_root
 
 # uv tool install ignores uv.lock, so pin the tool environment to the locked versions.
+readonly constraints="$work_dir/constraints.txt"
 uv export --frozen --no-dev --no-emit-project --no-hashes --no-header \
-    --directory "$repo_root" --output-file "$constraints" >/dev/null
+    --directory "$source_root" --output-file "$constraints" >/dev/null
 uv tool install --force --python 3.12 \
     --constraints "$constraints" \
     --reinstall-package "$package_name" \
-    "$repo_root"
+    "$source_root"
 
-install -D -m 0644 "$repo_root/src/bimax/icons/bimax.svg" "$icon_file"
-install -D -m 0644 "$repo_root/packaging/linux/$app_id.xml" "$mime_file"
-install -D -m 0644 "$repo_root/packaging/linux/$app_id.metainfo.xml" "$metainfo_file"
+install -D -m 0644 "$source_root/src/bimax/icons/bimax.svg" "$icon_file"
+install -D -m 0644 "$source_root/packaging/linux/$app_id.xml" "$mime_file"
+install -D -m 0644 "$source_root/packaging/linux/$app_id.metainfo.xml" "$metainfo_file"
 
 desktop-file-install \
     --dir="$data_root/applications" \
     --set-key=Exec --set-value="$bin_dir/bimax %f" \
     --set-key=TryExec --set-value="$bin_dir/bimax" \
-    "$repo_root/packaging/linux/$app_id.desktop"
+    "$source_root/packaging/linux/$app_id.desktop"
 
 refresh_caches
 
