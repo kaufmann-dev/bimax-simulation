@@ -9,6 +9,7 @@ import socket
 import stat
 import subprocess
 import sys
+import time
 from functools import partial
 from pathlib import Path
 
@@ -29,6 +30,47 @@ from mcp.types import (
 
 from .commands import CONVENTIONS
 from .protocol import MAX_MESSAGE, TOOLS, runtime_directory
+
+
+def desktop_environment():
+    """Restore desktop access when an MCP client filters its child environment."""
+    environment = dict(os.environ)
+    if environment.get("DISPLAY"):
+        return environment
+    manager_environment = dict(environment)
+    # systemctl resolves the user manager through its standard runtime directory,
+    # even when the private BIMAX sockets use a separate XDG_RUNTIME_DIR.
+    manager_environment["XDG_RUNTIME_DIR"] = f"/run/user/{os.getuid()}"
+    manager_environment.setdefault(
+        "DBUS_SESSION_BUS_ADDRESS", f"unix:path=/run/user/{os.getuid()}/bus"
+    )
+    try:
+        result = subprocess.run(
+            ["systemctl", "--user", "show-environment"],
+            env=manager_environment,
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=True,
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        raise RuntimeError(
+            "BIMAX cannot access the graphical desktop: DISPLAY is missing and the "
+            "user session environment is unavailable. Start BIMAX from your desktop "
+            "before connecting, or pass DISPLAY and XAUTHORITY in the MCP configuration."
+        ) from error
+    allowed = {"DISPLAY", "WAYLAND_DISPLAY", "XAUTHORITY", "XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS"}
+    for line in result.stdout.splitlines():
+        key, separator, value = line.partition("=")
+        if separator and key in allowed and value and not environment.get(key):
+            environment[key] = value
+    if not environment.get("DISPLAY"):
+        raise RuntimeError(
+            "BIMAX requires an active graphical desktop with DISPLAY available. "
+            "Start BIMAX from your desktop before connecting, or pass DISPLAY and "
+            "XAUTHORITY in the MCP configuration."
+        )
+    return environment
 
 
 class RemoteError(RuntimeError):
@@ -111,17 +153,22 @@ class Connection:
             executable = Path.home() / ".local/bin/bimax"
             if not executable.is_file():
                 raise FileNotFoundError("Install BIMAX first: ~/.local/bin/bimax is missing.")
-            subprocess.Popen(
+            app = subprocess.Popen(
                 [str(executable)],
+                env=desktop_environment(),
                 stdin=subprocess.DEVNULL,
                 stdout=sys.stderr,
                 stderr=sys.stderr,
                 start_new_session=True,
             )
-            import time
-
             deadline = time.monotonic() + 30
             while time.monotonic() < deadline:
+                exit_code = app.poll()
+                if exit_code is not None:
+                    raise RuntimeError(
+                        f"Installed BIMAX exited during startup (exit code {exit_code}). "
+                        "See the MCP server's stderr diagnostics."
+                    )
                 instances = self.discover()
                 if instances:
                     break
