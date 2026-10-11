@@ -900,7 +900,7 @@ class FourViews(QWidget):
     def export_scenario_images(self, output_dir: str | Path) -> list[Path]:
         """Export four standardized moved-fragment views and a contact sheet."""
         if self.document is None or self.document.fragments is None or not self.fragment_mode:
-            raise ValueError("Build and review the active cut plan before exporting scenario images.")
+            raise ValueError("Build and review the selected cuts before exporting scenario images.")
         visible = [actor for actor in self.actors.values() if actor.GetVisibility()]
         if not visible:
             raise ValueError("Select at least one visible structure before exporting scenario images.")

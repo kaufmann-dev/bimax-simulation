@@ -6,11 +6,14 @@ import time
 
 import numpy as np
 import pytest
+from factories import confirm
+from factories import document as assigned_document
 from PySide6.QtWidgets import QApplication
 
-from bimax.engine import build_fragments, default_cuts, required_fragment_labels
+from bimax.engine import build_fragments, default_cuts
 from bimax.jobs import Jobs
-from bimax.model import CutPlan, Document, Geometry, new_scenario
+from bimax.model import Document, Geometry, new_scenario
+from bimax.prepared import load_options, prepare_geometry
 from bimax.worker import anatomy_counts, execute
 
 
@@ -135,7 +138,7 @@ def document():
         np.zeros_like(labels),
         np.zeros_like(labels),
     )
-    doc.plan.cuts = default_cuts(doc)
+    doc.cuts = default_cuts(doc)
     return doc
 
 
@@ -161,168 +164,87 @@ def test_worker_supplies_anatomy_counts_for_ui(operation, monkeypatch):
     monkeypatch.setattr("bimax.engine.load_volume", lambda *args, **kwargs: doc)
     monkeypatch.setattr("bimax.storage.load_project", lambda *args, **kwargs: doc)
     monkeypatch.setattr("bimax.engine.separate", lambda *args, **kwargs: proposal)
-    monkeypatch.setattr("bimax.surfaces.make_surfaces", lambda *args, **kwargs: {})
     result = execute(operation, doc, {"path": "unused"})
     labels = proposal if operation == "separate" else doc.anatomy
     np.testing.assert_array_equal(result["anatomy_counts"], np.bincount(labels.ravel(), minlength=5))
 
 
 @pytest.mark.parametrize("accepted", [False, True])
-def test_open_prepares_exact_anatomy_and_active_reviewed_fragment_sets(accepted, monkeypatch, capsys):
-    doc = document()
-    doc.plan.accepted = accepted
-    fragments = np.array([0, 8, 1, 5, 7], dtype=np.uint8)[doc.anatomy]
-    builds = []
-
-    def build(document, *, validate, **kwargs):
-        builds.append((document.configuration_key, validate))
-        return fragments
-
-    labels_seen = []
-
-    def surfaces(labels, geometry, **kwargs):
-        assert geometry is doc.geometry
-        labels_seen.append(labels)
-        return {"unique-result": len(labels_seen)}
-
-    monkeypatch.setattr("bimax.storage.load_project", lambda *args, **kwargs: doc)
-    monkeypatch.setattr("bimax.engine.build_fragments", build)
-    monkeypatch.setattr("bimax.surface_cache.cached_surfaces", surfaces)
-    result = execute("open", None, {"path": "unused"})
-    assert "surfaces" not in result
-    assert labels_seen[0] is doc.anatomy
-    assert result["surface_sets"][False] == {"unique-result": 1}
-    progress = capsys.readouterr().out
-    assert "Building anatomy display" in progress
+def test_open_prepares_only_active_reviewed_fragments(accepted, monkeypatch):
+    doc = assigned_document()
+    doc.scenario.cut_ids = ["lefort1", "bsso", "genio"]
     if accepted:
-        assert builds == [(doc.configuration_key, True)]
-        assert doc.fragments is fragments
+        confirm(doc)
+    monkeypatch.setattr("bimax.storage.load_project", lambda *args, **kwargs: doc)
+    result = execute("open", None, {"path": "unused"})
+    assert set(result["surface_sets"]) == ({False, True} if accepted else {False})
+    assert result["fragment_mode"] == accepted
+    if accepted:
+        np.testing.assert_array_equal(doc.fragments, build_fragments(doc))
         assert doc.fragments_key == doc.configuration_key
-        assert len(labels_seen) == 2
-        assert labels_seen[1] is doc.fragments
-        assert result["surface_sets"][True] == {"unique-result": 2}
-        assert "Building fragment display" in progress
     else:
-        assert builds == []
         assert doc.fragments is None
-        assert doc.fragments_key is None
-        assert len(labels_seen) == 1
-        assert set(result["surface_sets"]) == {False}
 
 
-def test_cut_worker_returns_cached_fragment_counts(monkeypatch):
+def test_cut_worker_returns_cached_counts_and_artifacts_without_accepting():
     doc = document()
-    fragments = np.array([0, 8, 1, 5, 7], dtype=np.uint8)[doc.anatomy]
-    validation = []
-
-    def build(document, *, validate, **kwargs):
-        assert document is doc
-        validation.append(validate)
-        return fragments
-
-    monkeypatch.setattr("bimax.engine.build_fragments", build)
-    monkeypatch.setattr("bimax.surfaces.make_surfaces", lambda *args, **kwargs: {})
     result = execute("cuts_preview", doc, {})
-    np.testing.assert_array_equal(result["fragment_counts"], np.bincount(fragments.ravel(), minlength=9))
-    assert validation == [False]
+    np.testing.assert_array_equal(result["fragment_counts"], np.bincount(result["fragments"].ravel(), minlength=9))
     assert result["configuration_key"] == doc.configuration_key
-    assert not doc.plan.accepted
+    assert result["artifacts"]
+    assert not doc.cuts_accepted
     assert doc.fragments is None
 
 
-def six_plan_document():
-    source = np.ones((21, 21, 21), dtype=np.uint8)
-    anatomy = np.where(np.indices(source.shape)[0] < 9, 3, 2).astype(np.uint8)
-    doc = Document(
-        Geometry(source.shape, (1.0,) * 3, (0.0,) * 3, tuple(np.eye(3).ravel())),
-        source, anatomy, np.zeros_like(source), np.zeros_like(source),
-    )
-    doc.plans.clear()
+def six_scenario_document():
+    doc = assigned_document()
     doc.scenarios.clear()
     for level in (1, 2, 3):
         for genio in (False, True):
             name = f"lf{level}-genio{int(genio)}"
-            cuts = default_cuts(doc, level)
-            if level == 1:
-                cuts["lefort"]["planes"]["upper"]["origin"][2] = 11
-            cuts["lefort"]["enabled"] = cuts["bsso"]["enabled"] = True
-            cuts["genio"]["enabled"] = genio
-            doc.plans[name] = CutPlan(name, level, cuts)
-            doc.scenarios[name] = new_scenario(name)
+            doc.scenarios[name] = new_scenario([f"lefort{level}", "bsso", *(["genio"] if genio else [])])
             doc.active_scenario = name
-            labels = build_fragments(doc, validate=False)
-            for label in required_fragment_labels(doc.plan):
-                xyz = np.argwhere(labels == label)[0][::-1]
-                doc.plan.confirmations[str(label)] = doc.world_to_plan(doc.geometry.index_to_world(xyz)).tolist()
-            doc.plan.accepted = True
+            confirm(doc)
     doc.active_scenario = "lf2-genio1"
     return doc
 
 
-def test_open_six_plans_builds_only_active_configuration(monkeypatch):
-    doc = six_plan_document()
-    expected = build_fragments(doc)
-    built, meshed = [], []
-
-    def build(document, *, validate, **kwargs):
-        built.append((document.scenario.plan_id, validate))
-        return expected
-
-    def surfaces(labels, *args, **kwargs):
-        meshed.append(labels)
-        return {}
-
+def test_open_six_scenarios_prepares_only_active_configuration(monkeypatch):
+    doc = six_scenario_document()
+    keys = []
+    def record(document, *args, **kwargs):
+        keys.append(document.configuration_key)
+        return prepare_geometry(document, *args, **kwargs)
     monkeypatch.setattr("bimax.storage.load_project", lambda *args, **kwargs: doc)
-    monkeypatch.setattr("bimax.engine.build_fragments", build)
-    monkeypatch.setattr("bimax.surface_cache.cached_surfaces", surfaces)
-    result = execute("open", None, {"path": "six-plans.bimax"})
-    assert built == [("lf2-genio1", True)]
-    assert len(meshed) == 2
-    assert meshed[0] is doc.anatomy
-    assert meshed[1] is expected
-    assert result["document"].fragments_key == ("lf2-genio1", 0, 0)
-    assert result["document"].fragments is expected
-    assert result["fragment_mode"] is True
-    assert len(doc.plans) == len(doc.scenarios) == 6
-    assert all(not any(isinstance(value, np.ndarray) for value in vars(plan).values()) for plan in doc.plans.values())
+    monkeypatch.setattr("bimax.prepared.prepare_geometry", record)
+    result = execute("open", None, {"path": "unused"})
+    assert keys == [doc.configuration_key]
+    assert result["fragment_mode"]
+    assert len(doc.cuts) == 7
+    assert len(doc.scenarios) == 6
+    assert doc.cut_key("lefort2") in doc.artifacts
+    assert doc.cut_key("lefort1") not in doc.artifacts
+    assert doc.cut_key("lefort3") not in doc.artifacts
 
 
-def test_prepare_plan_reuses_exact_mesh_cache_and_returns_configuration_key(monkeypatch):
-    from bimax.surfaces import make_surfaces
-
-    doc = six_plan_document()
-    doc.active_scenario = "lf1-genio0"
-    meshed = []
-
-    def surfaces(labels, geometry, **kwargs):
-        meshed.append(labels.copy())
-        return make_surfaces(labels, geometry, **kwargs)
-
-    monkeypatch.setattr("bimax.surfaces.make_surfaces", surfaces)
-    cold = execute("prepare_plan", doc, {})
-    warm = execute("prepare_plan", doc, {})
-    assert len(meshed) == 1
-    assert cold["configuration_key"] == warm["configuration_key"] == doc.configuration_key
-    np.testing.assert_array_equal(cold["fragments"], warm["fragments"])
-    for label, mesh in cold["surfaces"].items():
-        for field in ("vertices", "faces", "normals"):
-            np.testing.assert_array_equal(getattr(mesh, field), getattr(warm["surfaces"][label], field))
-    assert doc.fragments is None, "Workers return derived geometry; the GUI owns acceptance"
-    # Changing geometry requires different labels and a different cache entry,
-    # even though this is still the same named cut plan.
-    doc.plan.cuts["lefort"]["planes"]["upper"]["origin"][2] += 1
-    doc.plan.revision += 1
-    changed = execute("prepare_plan", doc, {})
-    assert len(meshed) == 2
-    assert changed["configuration_key"] != cold["configuration_key"]
-    assert changed["configuration_key"] == doc.configuration_key
-    assert np.any(changed["fragments"] != cold["fragments"])
-
-
-def test_prepare_plan_rejects_unreviewed_geometry_before_building(monkeypatch):
+def test_prepared_cache_hit_worker_needs_no_document_arrays(monkeypatch):
+    doc = six_scenario_document()
+    first = execute("prepare_scene", doc, {})
     def unexpected(*args, **kwargs):
-        raise AssertionError("Unreviewed plans must not prepare movement geometry.")
+        pytest.fail("A cache hit must not evaluate cuts or rebuild surfaces")
+    monkeypatch.setattr("bimax.prepared.cut_membership", unexpected)
+    monkeypatch.setattr("bimax.surfaces.make_surfaces", unexpected)
+    warm = execute("load_prepared", None, load_options(doc))
+    np.testing.assert_array_equal(warm["fragments"], first["fragments"])
+    assert warm["configuration_key"] == doc.configuration_key
 
-    monkeypatch.setattr("bimax.engine.build_fragments", unexpected)
+
+def test_missing_cache_hit_requests_preparation():
+    doc = six_scenario_document()
+    result = execute("load_prepared", None, load_options(doc))
+    assert result == {"needs_preparation": True, "configuration_key": doc.configuration_key, "document_id": doc._identity}
+
+
+def test_prepare_scene_rejects_unreviewed_geometry():
     with pytest.raises(ValueError, match="Preview and accept"):
-        execute("prepare_plan", document(), {})
+        execute("prepare_scene", document(), {})

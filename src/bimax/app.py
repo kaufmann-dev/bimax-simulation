@@ -6,7 +6,6 @@ import sys
 from collections import OrderedDict
 from copy import deepcopy
 from pathlib import Path
-from uuid import uuid4
 
 import numpy as np
 from PySide6.QtCore import Qt, QTimer
@@ -36,7 +35,9 @@ from PySide6.QtWidgets import (
 
 from .history import Edit, History
 from .jobs import Jobs
-from .model import ANATOMY, FRAGMENTS, Document, new_scenario
+from .model import ANATOMY, CUT_TYPES, Document, new_scenario
+
+SCENE_CACHE_BYTES = 768 * 1024**2
 
 STYLE = """
 QWidget { background: #000000; color: #e6e6e6; font-size: 13px; }
@@ -128,7 +129,7 @@ class MainWindow(QMainWindow):
         self._fragment_meshes = None
         self._fragment_counts = None
         self._pending_key = None
-        self._plan_cache = OrderedDict()
+        self._scene_cache = OrderedDict()
         self.pick_mode = None
         self.last_point = None
         self.selected_fragment = 1
@@ -151,16 +152,20 @@ class MainWindow(QMainWindow):
         self._build_separate()
         self._build_cut()
         self._build_move()
-        for combo in (self.cut_plan_combo, self.move_plan_combo, self.cut_scenario_combo, self.scenario_combo):
-            combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
-            combo.setMinimumContentsLength(12)
-            combo.setMinimumWidth(0)
-            combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.scenario_combo = QComboBox()
+        self.scenario_combo.currentTextChanged.connect(self._scenario_changed)
+        self.scenario_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        self.scenario_combo.setMinimumContentsLength(12)
+        self.scenario_combo.setMinimumWidth(0)
+        self.scenario_combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.tabs.currentChanged.connect(self._stage_changed)
         split = QSplitter()
         sidebar = QWidget()
         sidebar_layout = QVBoxLayout(sidebar)
         sidebar_layout.setContentsMargins(0, 0, 0, 0)
+        scenario_form = form_layout()
+        scenario_form.addRow("Scenario", self.scenario_combo)
+        sidebar_layout.addLayout(scenario_form)
         sidebar_layout.addWidget(self.tabs, 1)
         self.structure_box = QGroupBox("Visible structures")
         self.structure_layout = QGridLayout(self.structure_box)
@@ -325,30 +330,22 @@ class MainWindow(QMainWindow):
             "Adjust geometric cuts in the unmoved anatomy. BSSO uses a stepped split; its two proximal pieces remain fixed.",
             layout,
         )
-        selectors = form_layout()
-        self.cut_scenario_combo = QComboBox()
-        self.cut_scenario_combo.currentTextChanged.connect(self._scenario_changed)
-        selectors.addRow("Scenario", self.cut_scenario_combo)
-        self.cut_plan_combo = QComboBox()
-        self.cut_plan_combo.currentIndexChanged.connect(
-            lambda: self._plan_selected(self.cut_plan_combo.currentData())
-        )
-        selectors.addRow("Scenario's cut plan", self.cut_plan_combo)
-        layout.addLayout(selectors)
-        button("Create cut plan and scenario…", self._create_plan, layout)
-        self.plan_note = note(
-            "A cut plan is shared by its linked scenarios. Duplicate it to edit an independent alternative.",
-            layout,
-        )
+        self.cut_checks = {}
+        for cut_id, (name, _, _) in CUT_TYPES.items():
+            check = QCheckBox(name)
+            check.toggled.connect(lambda enabled, key=cut_id: self._select_cut(key, enabled))
+            self.cut_checks[cut_id] = check
+            layout.addWidget(check)
+        self.cut_note = note("Edit each shared cut once. Scenarios select combinations of these cuts.", layout)
         form = form_layout()
         self.operation_combo = QComboBox()
-        for name, key in (("Le Fort I", "lefort"), ("BSSO", "bsso"), ("Genioplasty", "genio")):
-            self.operation_combo.addItem(name, key)
+        for cut_id, (name, _, _) in CUT_TYPES.items():
+            self.operation_combo.addItem(name, cut_id)
+        self.operation_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        self.operation_combo.setMinimumContentsLength(12)
+        self.operation_combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.operation_combo.currentIndexChanged.connect(self._load_cut_controls)
-        form.addRow("Operation", self.operation_combo)
-        self.cut_enabled = QCheckBox("Enable operation")
-        self.cut_enabled.toggled.connect(self._cut_toggled)
-        form.addRow(self.cut_enabled)
+        form.addRow("Edit shared cut", self.operation_combo)
         self.plane_combo = QComboBox()
         self.plane_combo.currentIndexChanged.connect(self._load_plane_controls)
         form.addRow("Cut plane", self.plane_combo)
@@ -372,15 +369,13 @@ class MainWindow(QMainWindow):
         )
         confirm_form = form_layout()
         self.confirm_combo = QComboBox()
-        for value in (2, 3, 4, 5, 6):
-            self.confirm_combo.addItem(FRAGMENTS[value], value)
         confirm_form.addRow("Confirm piece", self.confirm_combo)
         layout.addLayout(confirm_form)
         button("Identify piece at next pick", lambda: self._arm_pick("confirm"), layout)
         self.confirm_label = note(
             "Confirm the enabled fragments by picking a point inside each one.", layout
         )
-        self.accept_cuts_button = button("Accept cuts", lambda: self._build_cuts(True), layout)
+        self.accept_cuts_button = button("Accept combination", lambda: self._build_cuts(True), layout)
         button("Continue to movement", lambda: self.tabs.setCurrentIndex(3), layout)
         layout.addStretch()
 
@@ -388,25 +383,13 @@ class MainWindow(QMainWindow):
         layout = self._tab("Move")
         note("Move the jaws", layout).setStyleSheet("font-size: 18px;")
         form = form_layout()
-        self.scenario_combo = QComboBox()
-        self.scenario_combo.currentTextChanged.connect(self._scenario_changed)
-        form.addRow("Scenario", self.scenario_combo)
-        self.move_plan_combo = QComboBox()
-        self.move_plan_combo.currentIndexChanged.connect(
-            lambda: self._plan_selected(self.move_plan_combo.currentData())
-        )
-        form.addRow("Scenario's cut plan", self.move_plan_combo)
-        self.move_plan_note = QLabel()
-        self.move_plan_note.setWordWrap(True)
-        form.addRow(self.move_plan_note)
+        self.move_cut_note = QLabel()
+        self.move_cut_note.setWordWrap(True)
+        form.addRow(self.move_cut_note)
         self.motion_combo = QComboBox()
-        for name, key in (
-            ("Linked jaws", "linked"),
-            ("Maxilla", "maxilla"),
-            ("Distal mandible", "mandible"),
-            ("Chin", "chin"),
-        ):
-            self.motion_combo.addItem(name, key)
+        self.motion_combo.addItem("Linked jaws", "linked")
+        self.motion_combo.addItem("Distal mandible", "mandible")
+        self.motion_combo.addItem("Chin", "chin")
         self.motion_combo.currentIndexChanged.connect(self._load_motion)
         form.addRow("Move", self.motion_combo)
         self.motion_spins = []
@@ -465,6 +448,7 @@ class MainWindow(QMainWindow):
     def _busy_changed(self, busy):
         self.cancel_button.setVisible(busy)
         self.tabs.setEnabled(not busy)
+        self.scenario_combo.setEnabled(self.doc is not None and not busy)
         if busy:
             self._remesh_timer.stop()
         if not busy and self.jobs._cancel.is_set():
@@ -512,7 +496,7 @@ class MainWindow(QMainWindow):
             can_move = self.doc is not None and self.doc.fragments is not None and not busy
             self.motion_combo.setEnabled(can_move)
             if self.doc is not None:
-                chin_enabled = self.doc.plan.cuts.get("genio", {}).get("enabled", False)
+                chin_enabled = "genio" in self.doc.scenario.cut_ids
                 motion_model = self.motion_combo.model()
                 if isinstance(motion_model, QStandardItemModel):
                     motion_model.item(self.motion_combo.findData("chin")).setEnabled(chin_enabled)
@@ -547,66 +531,56 @@ class MainWindow(QMainWindow):
         self.dirty = True
         self.setWindowTitle(f"BIMAX — {self.doc.source_name if self.doc else ''} *")
 
-    def _invalidate(self, all_plans=False):
-        if self.doc:
+    def _invalidate(self, all_anatomy=False, cut_id=None):
+        if self.doc is None:
+            return
+        key = cut_id or self.operation_combo.currentData()
+        affected = list(self.doc.cuts) if all_anatomy else [key]
+        for cid in affected:
+            cut = self.doc.cuts[cid]
+            cut.confirmations = {}
+            cut.accepted = False
+            cut.revision += 1
+        for scenario in self.doc.scenarios.values():
+            if all_anatomy or key in scenario.cut_ids:
+                scenario.landmarks = []
+        if all_anatomy:
+            self.doc.anatomy_revision += 1
+            self.doc.reviews.clear()
+            self._scene_cache.clear()
+        if all_anatomy or key in self.doc.scenario.cut_ids:
             self.doc.fragments = None
             self.doc.fragments_key = None
-            affected = self.doc.plans.values() if all_plans else [self.doc.plan]
-            for plan in affected:
-                plan.confirmations = {}
-                plan.accepted = False
-                plan.revision += 1
-            for scenario in self.doc.scenarios.values():
-                if all_plans or scenario.plan_id == self.doc.scenario.plan_id:
-                    scenario.landmarks = []
-            if all_plans:
-                self.doc.anatomy_revision += 1
-                self._plan_cache.clear()
-            else:
-                for key in list(self._plan_cache):
-                    if key[0] == self.doc.scenario.plan_id:
-                        del self._plan_cache[key]
+            self._loaded_meshes.pop(True, None)
+            self.views.invalidate_surfaces(True)
+            self.views.set_transforms({})
         self.pending_fragments = None
         self.pending_separation = None
         self._separation_meshes = self._separation_counts = None
         self._fragment_meshes = self._fragment_counts = None
         self._pending_key = None
-        self._loaded_meshes.pop(True, None)
-        self.views.invalidate_surfaces(True)
-        self.views.set_transforms({})
-        if self.doc is not None:
+        if self.doc.fragments is None:
             self._display(self._loaded_meshes.get(False, {}), False, self.doc.anatomy)
-        self.confirm_label.setText(
-            "Confirm the enabled fragments by picking a point inside each one."
-        )
+        self.confirm_label.setText("Confirm new pieces by picking a point inside each one.")
+        self._load_scenario_controls()
         self._sync_enabled()
-        self._load_plan_selectors()
 
-    def _cache_active_plan(self):
-        """Keep at most two prepared alternatives, within a 768 MiB label/mesh budget."""
+    def _cache_active_scene(self):
         if self.doc is None or self.doc.fragments is None or True not in self._loaded_meshes:
             return
-        key = self.doc.configuration_key
-        if self.doc.fragments_key != key or not self.doc.plan.accepted:
+        key = self.doc.configuration_key if self.doc.cuts_accepted else None
+        if self.doc.fragments_key != key or not self.doc.cuts_accepted:
             return
-        self._plan_cache[key] = (self.doc.fragments, self._loaded_meshes[True])
-        self._plan_cache.move_to_end(key)
-
+        self._scene_cache[key] = (self.doc.fragments, self._loaded_meshes[True])
+        self._scene_cache.move_to_end(key)
         def size(entry):
             labels, meshes = entry
-            return labels.nbytes + sum(
-                mesh.vertices.nbytes + mesh.faces.nbytes + mesh.normals.nbytes
-                for mesh in meshes.values()
-            )
+            return labels.nbytes + sum(mesh.vertices.nbytes + mesh.faces.nbytes + mesh.normals.nbytes
+                                      for mesh in meshes.values())
+        while self._scene_cache and sum(size(entry) for entry in self._scene_cache.values()) > SCENE_CACHE_BYTES:
+            self._scene_cache.popitem(last=False)
 
-        while self._plan_cache and (
-            len(self._plan_cache) > 2
-            or sum(size(entry) for entry in self._plan_cache.values()) > 768 * 1024**2
-        ):
-            self._plan_cache.popitem(last=False)
-
-    def _activate_plan(self):
-        """Swap only derived geometry; every scenario keeps its own movements and landmarks."""
+    def _activate_scene(self):
         if self.doc is None:
             return
         self.pending_fragments = self.pending_separation = None
@@ -614,115 +588,75 @@ class MainWindow(QMainWindow):
         self._separation_meshes = self._separation_counts = None
         self._pending_key = None
         self.pick_mode = None
-        key = self.doc.configuration_key
-        if self.doc.fragments_key != key:
+        key = self.doc.configuration_key if self.doc.cuts_accepted else None
+        if self.doc.fragments_key != key or not self.doc.cuts_accepted:
             self.doc.fragments = None
             self.doc.fragments_key = None
             self._loaded_meshes.pop(True, None)
             self.views.invalidate_surfaces(True)
-        if self.doc.plan.accepted and self.doc.fragments is None and key in self._plan_cache:
-            self.doc.fragments, self._loaded_meshes[True] = self._plan_cache[key]
+        if self.doc.cuts_accepted and self.doc.fragments is None and key in self._scene_cache:
+            self.doc.fragments, self._loaded_meshes[True] = self._scene_cache[key]
             self.doc.fragments_key = key
-            self._plan_cache.move_to_end(key)
-        self._load_plan_selectors()
+            self._scene_cache.move_to_end(key)
+        self._load_scenario_controls()
         self._load_cut_controls()
         self._load_motion()
         self._stage_changed(self.tabs.currentIndex())
 
-    def _load_plan_selectors(self):
+    def _load_scenario_controls(self):
         if self.doc is None:
             return
+        from .engine import required_fragment_labels
         previous, self.loading = self.loading, True
-        for combo in (self.scenario_combo, self.cut_scenario_combo):
-            combo.clear()
-            combo.addItems(list(self.doc.scenarios))
-            combo.setCurrentText(self.doc.active_scenario)
-            combo.setToolTip(combo.currentText())
-        for combo in (self.cut_plan_combo, self.move_plan_combo):
-            combo.clear()
-            for plan_id, plan in self.doc.plans.items():
-                combo.addItem(plan.name, plan_id)
-            combo.setCurrentIndex(combo.findData(self.doc.scenario.plan_id))
-            combo.setToolTip(combo.currentText())
-        plan = self.doc.plan
-        level = {1: "I", 2: "II", 3: "III"}[plan.lefort_level]
-        operations = [f"Le Fort {level}"]
-        if plan.cuts.get("bsso", {}).get("enabled"):
-            operations.append("BSSO")
-        operations.append(
-            "with genioplasty"
-            if plan.cuts.get("genio", {}).get("enabled")
-            else "without genioplasty"
-        )
-        summary = " · ".join(operations)
-        self.plan_note.setText(
-            summary
-            + ". Edits affect every scenario linked to this plan. These are geometric approximations, not surgical cut guides."
-        )
-        self.move_plan_note.setText(
-            summary + (" · cuts accepted" if plan.accepted else " · preview and accept cuts first")
-        )
-        self.operation_combo.setItemText(
-            self.operation_combo.findData("lefort"), f"Le Fort {level}"
-        )
-        self.motion_combo.setItemText(
-            self.motion_combo.findData("maxilla"), self.doc.fragment_names[2]
-        )
-        for i in range(self.confirm_combo.count()):
-            self.confirm_combo.setItemText(
-                i, self.doc.fragment_names[self.confirm_combo.itemData(i)]
-            )
+        self.scenario_combo.clear()
+        self.scenario_combo.addItems(list(self.doc.scenarios))
+        self.scenario_combo.setCurrentText(self.doc.active_scenario)
+        self.scenario_combo.setToolTip(self.doc.active_scenario)
+        for key, check in self.cut_checks.items():
+            check.setChecked(key in self.doc.scenario.cut_ids)
+            check.setToolTip(self.doc.cuts[key].name)
+        selected = " + ".join(self.doc.cuts[key].name for key in self.doc.scenario.cut_ids) or "No cuts selected"
+        self.move_cut_note.setText(selected + (" · accepted" if self.doc.cuts_accepted else " · preview and accept first"))
+        self.cut_note.setText("Shared edits affect every scenario using that cut. Modified templates need review before use.")
+        old = self.motion_combo.currentData()
+        self.motion_combo.clear()
+        self.motion_combo.addItem("Linked jaws", "linked")
+        for key in reversed(self.doc.upper_cuts):
+            label = self.doc.fragment_labels[f"upper:{key}"]
+            self.motion_combo.addItem(self.doc.fragment_names[label], key)
+        self.motion_combo.addItem("Distal mandible", "mandible")
+        self.motion_combo.addItem("Chin", "chin")
+        self.motion_combo.setCurrentIndex(max(0, self.motion_combo.findData(old)))
+        old = self.confirm_combo.currentData()
+        self.confirm_combo.clear()
+        required = required_fragment_labels(self.doc)
+        if self._anatomy_counts is not None and self._anatomy_counts[3]:
+            required.add(5)
+        for label in sorted(required):
+            self.confirm_combo.addItem(self.doc.fragment_names[label], label)
+        self.confirm_combo.setCurrentIndex(max(0, self.confirm_combo.findData(old)))
         self.loading = previous
 
-    def _plan_selected(self, plan_id):
-        if (
-            self.loading
-            or self.doc is None
-            or self.jobs.busy
-            or plan_id not in self.doc.plans
-            or plan_id == self.doc.scenario.plan_id
-        ):
+    def _select_cut(self, cut_id, enabled):
+        if self.loading or self.doc is None or self.jobs.busy:
             return
         self._finish_motion_edit()
+        self._cache_active_scene()
         before = deepcopy(self.doc.scenarios)
-        self.doc.scenario.plan_id = plan_id
-        # A landmark's fragment membership is specific to its cut plan.
+        selected = self.doc.scenario.cut_ids
+        if enabled and cut_id not in selected:
+            cut = self.doc.cuts[cut_id]
+            if cut.kind == "lefort":
+                selected[:] = [key for key in selected if not (
+                    self.doc.cuts[key].kind == "lefort" and self.doc.cuts[key].level == cut.level)]
+            selected.append(cut_id)
+        elif not enabled and cut_id in selected:
+            selected.remove(cut_id)
+        else:
+            return
         self.doc.scenario.landmarks = []
-        self._remember(
-            "Select cut plan", {"scenarios": before}, {"scenarios": deepcopy(self.doc.scenarios)}
-        )
-        self._activate_plan()
-
-    def _create_plan(self):
-        if self.doc is None or self.jobs.busy:
-            return
-        operation, ok = QInputDialog.getItem(
-            self,
-            "New cut plan",
-            "Le Fort operation",
-            ["Le Fort I", "Le Fort II", "Le Fort III"],
-            self.doc.plan.lefort_level - 1,
-            False,
-        )
-        if not ok:
-            return
-        name, ok = QInputDialog.getText(
-            self, "New cut plan", "New plan and scenario name", text=f"{operation} alternative"
-        )
-        name = name.strip()
-        if not ok or not name:
-            return
-        if name in self.doc.scenarios or any(plan.name == name for plan in self.doc.plans.values()):
-            self._error("Choose a unique plan and scenario name.")
-            return
-        self._finish_motion_edit()
-        self.jobs.submit(
-            "create_plan",
-            self.doc,
-            name=name,
-            plan_id=uuid4().hex,
-            level=["Le Fort I", "Le Fort II", "Le Fort III"].index(operation) + 1,
-        )
+        self._remember("Select shared cuts", {"scenarios": before}, {"scenarios": deepcopy(self.doc.scenarios)})
+        self._activate_scene()
 
     def _remember(self, name, before, after, patches=None):
         self.history.push(Edit(name, patches or [], before, after))
@@ -826,24 +760,34 @@ class MainWindow(QMainWindow):
     def _job_finished(self, operation, revision, result):
         if operation not in ("import", "open") and self.doc is None:
             return
-        if operation not in ("import", "open") and self.doc and revision != self.doc.revision:
+        if operation not in ("import", "open") and self.doc and operation != "load_prepared" and revision != self.doc.revision:
             self._status("Discarded an outdated computation result.")
             return
+        if self.doc is not None and "document_id" in result and result["document_id"] != self.doc._identity:
+            self._status("Discarded a result for a different document.")
+            return
+        if self.doc is not None and "anatomy_fingerprint" in result:
+            digest = result["anatomy_fingerprint"]
+            if digest["revision"] == self.doc.anatomy_revision:
+                self.doc._anatomy_digest = digest["digest"]
+                self.doc._digest_revision = digest["revision"]
         if (
             self.doc
             and "configuration_key" in result
-            and tuple(result["configuration_key"]) != self.doc.configuration_key
+            and result["configuration_key"] != self.doc.configuration_key
         ):
-            self._status("Discarded a result for a different cut plan.")
+            self._status("Discarded a result for different cuts or anatomy.")
             return
+        if self.doc is not None and "artifacts" in result:
+            self.doc.artifacts.update(result["artifacts"])
         if operation in ("import", "open"):
             self.doc = result["document"]
             assert self.doc is not None
             self.doc.source.setflags(write=False)
             self.project_path = result.get("path") if operation == "open" else None
             self._loaded_meshes = result["surface_sets"]
-            self._plan_cache.clear()
-            self._cache_active_plan()
+            self._scene_cache.clear()
+            self._cache_active_scene()
             self._anatomy_counts = result["anatomy_counts"]
             self.history = History()
             self.pending_separation = self.pending_fragments = None
@@ -871,37 +815,31 @@ class MainWindow(QMainWindow):
             self.pending_fragments = result["fragments"]
             self._fragment_meshes = result["surfaces"]
             self._fragment_counts = result["fragment_counts"]
-            self._pending_key = tuple(result["configuration_key"])
+            self._pending_key = result["configuration_key"]
+            self._load_scenario_controls()
             self._display(result["surfaces"], True, self.pending_fragments)
             self.views.set_transforms({})
             self._status(
-                "Fragment preview ready. Identify the enabled pieces, then accept the cuts."
+                "Fragment preview ready. Existing confirmations are reused; identify any new pieces, then accept."
             )
-        elif operation == "prepare_plan":
+        elif operation in ("prepare_scene", "load_prepared"):
             assert self.doc is not None
+            if result.get("needs_preparation"):
+                self.jobs.submit("prepare_scene", self.doc)
+                self._status("Preparing this combination once…")
+                return
+            from .engine import validate_fragment_preview
+            try:
+                validate_fragment_preview(self.doc, result["fragments"], result["fragment_counts"], result["anatomy_counts"])
+            except ValueError as error:
+                self._error(str(error))
+                return
             self.doc.fragments = result["fragments"]
-            self.doc.fragments_key = tuple(result["configuration_key"])
+            self.doc.fragments_key = result["configuration_key"]
             self._loaded_meshes[True] = result["surfaces"]
-            self._cache_active_plan()
+            self._cache_active_scene()
             self._stage_changed(self.tabs.currentIndex())
-            self._status(f"{self.doc.plan.name} ready.")
-        elif operation == "create_plan":
-            assert self.doc is not None
-            before = {
-                key: deepcopy(getattr(self.doc, key))
-                for key in ("plans", "scenarios", "active_scenario")
-            }
-            self.doc.plans[result["plan_id"]] = result["plan"]
-            name = result["plan"].name
-            self.doc.scenarios[name] = new_scenario(result["plan_id"])
-            self.doc.active_scenario = name
-            self._remember(
-                "Create cut plan", before, {key: deepcopy(getattr(self.doc, key)) for key in before}
-            )
-            self._activate_plan()
-            self._status(
-                "Independent cut plan created. Adjust and preview its cuts before movement."
-            )
+            self._status("Saved combination ready.")
         elif operation == "surfaces":
             self._loaded_meshes[result["fragment_mode"]] = result["surfaces"]
             self._anatomy_counts = result["anatomy_counts"]
@@ -941,7 +879,7 @@ class MainWindow(QMainWindow):
             spin.setValue(size)
         for spin in self.roi_start:
             spin.setValue(0)
-        self._load_plan_selectors()
+        self._load_scenario_controls()
         # Decode the orthonormal planning rotation relative to the initial LPS→RAS basis.
         from scipy.spatial.transform import Rotation
 
@@ -1007,7 +945,7 @@ class MainWindow(QMainWindow):
         indices, before, after = indices[keep], before[keep], after[keep]
         if not len(indices):
             return
-        metadata_before = self._plan_edit_snapshot() if field == "anatomy" else {}
+        metadata_before = self._cut_edit_snapshot() if field == "anatomy" else {}
         array[indices] = after
         if field == "anatomy" and self._anatomy_counts is not None:
             self._anatomy_counts += np.bincount(after, minlength=5) - np.bincount(
@@ -1015,15 +953,15 @@ class MainWindow(QMainWindow):
             )
         if field == "anatomy":
             self._loaded_meshes.pop(False, None)
-            self._invalidate(all_plans=True)
+            self._invalidate(all_anatomy=True)
         else:
             # Editing separation hints does not change the accepted anatomy or
-            # any operation plan. Only discard the now-stale pending proposals.
-            self._activate_plan()
+            # any accepted cut geometry. Only discard the now-stale pending proposals.
+            self._activate_scene()
         self._remember(
             name,
             metadata_before,
-            self._plan_edit_snapshot() if field == "anatomy" else {},
+            self._cut_edit_snapshot() if field == "anatomy" else {},
             [(field, indices, before, after)],
         )
         self.views.refresh_slices()
@@ -1077,15 +1015,15 @@ class MainWindow(QMainWindow):
             self._separation_counts,
         )
         before = self.doc.anatomy
-        metadata_before = self._plan_edit_snapshot()
+        metadata_before = self._cut_edit_snapshot()
         self.doc.anatomy = proposal
         self._loaded_meshes[False] = meshes
-        self._invalidate(all_plans=True)
+        self._invalidate(all_anatomy=True)
         self._anatomy_counts = counts
         self._remember(
             "Accept separation",
             {"anatomy": before, **metadata_before},
-            {"anatomy": proposal, **self._plan_edit_snapshot()},
+            {"anatomy": proposal, **self._cut_edit_snapshot()},
         )
         self._remesh_timer.stop()
         self._display(meshes, False)
@@ -1117,13 +1055,18 @@ class MainWindow(QMainWindow):
         self.views.set_tool("navigate")
         self.views.set_plane([0, 0, 0], [0, 0, 1], False)
         if (
-            self.doc.plan.accepted
+            self.doc.cuts_accepted
             and self.doc.fragments is None
             and index != 1
             and not self.jobs.busy
         ):
-            self.jobs.submit("prepare_plan", self.doc)
-            self._status(f"Preparing {self.doc.plan.name} in the background…")
+            from .prepared import load_options
+            if self.doc.configuration_key in self.doc.artifacts:
+                self.jobs.submit("load_prepared", None, **load_options(self.doc))
+                self._status("Loading saved combination…")
+            else:
+                self.jobs.submit("prepare_scene", self.doc)
+                self._status("Preparing this combination once…")
         mode = self.doc.fragments is not None and index != 1
         labels = self.doc.fragments if mode else self.doc.anatomy
         meshes = self._loaded_meshes.get(mode)
@@ -1150,15 +1093,16 @@ class MainWindow(QMainWindow):
 
     def _cut_config(self):
         assert self.doc is not None
-        return self.doc.plan.cuts[self.operation_combo.currentData()]
+        return self.doc.cuts[self.operation_combo.currentData()].geometry
 
     def _selected_plane(self):
+        assert self.doc is not None
         config = self._cut_config()
         key = self.plane_combo.currentData()
         if self.operation_combo.currentData() == "bsso":
             side, plane = key.split(".")
             return config[side][plane]
-        if self.operation_combo.currentData() == "lefort":
+        if self.doc.cuts[self.operation_combo.currentData()].kind == "lefort":
             return config["planes"][key]
         return config["plane"]
 
@@ -1168,13 +1112,12 @@ class MainWindow(QMainWindow):
         self.loading = True
         config = self._cut_config()
         bsso = self.operation_combo.currentData() == "bsso"
-        self.cut_enabled.setChecked(config["enabled"])
         self.plane_combo.clear()
         if bsso:
             for side in ("left", "right"):
                 for key in ("front", "upper", "sagittal"):
                     self.plane_combo.addItem(f"{side.title()} {key}", f"{side}.{key}")
-        elif self.operation_combo.currentData() == "lefort":
+        elif self.doc.cuts[self.operation_combo.currentData()].kind == "lefort":
             for key in config["planes"]:
                 self.plane_combo.addItem(key.replace("_", " ").title(), key)
         else:
@@ -1208,21 +1151,12 @@ class MainWindow(QMainWindow):
         plane = self._selected_plane()
         origin = self.doc.plan_to_world(plane["origin"])
         normal = self.doc.frame[:3, :3].T @ np.asarray(plane["normal"])
-        self.views.set_plane(origin, normal, self._cut_config()["enabled"])
+        self.views.set_plane(origin, normal, self.operation_combo.currentData() in self.doc.scenario.cut_ids)
 
-    def _plan_edit_snapshot(self):
+    def _cut_edit_snapshot(self):
         assert self.doc is not None
-        return {"plans": deepcopy(self.doc.plans), "scenarios": deepcopy(self.doc.scenarios)}
-
-    def _cut_toggled(self, enabled):
-        if self.loading or self.doc is None:
-            return
-        before = self._plan_edit_snapshot()
-        self._cut_config()["enabled"] = enabled
-        self._invalidate()
-        self._remember("Enable operation", before, self._plan_edit_snapshot())
-        self._load_plan_selectors()
-        self._show_cut_plane()
+        return {"cuts": deepcopy(self.doc.cuts), "scenarios": deepcopy(self.doc.scenarios),
+                "reviews": deepcopy(self.doc.reviews)}
 
     def _plane_controls_changed(self):
         if self.loading or self.doc is None:
@@ -1232,20 +1166,20 @@ class MainWindow(QMainWindow):
             self._error("A cut plane needs a nonzero normal.")
             self._load_plane_controls()
             return
-        before = self._plan_edit_snapshot()
+        before = self._cut_edit_snapshot()
         plane = self._selected_plane()
         plane["origin"] = [s.value() for s in self.plane_origin]
         plane["normal"] = (normal / np.linalg.norm(normal)).tolist()
-        if before == self._plan_edit_snapshot():
+        if before == self._cut_edit_snapshot():
             return
         self._invalidate()
-        self._remember("Adjust cut plane", before, self._plan_edit_snapshot())
+        self._remember("Adjust cut plane", before, self._cut_edit_snapshot())
         self._show_cut_plane()
 
     def _region_changed(self):
         if self.loading or self.doc is None:
             return
-        before = self._plan_edit_snapshot()
+        before = self._cut_edit_snapshot()
         config = self._cut_config()
         if self.operation_combo.currentData() == "bsso":
             config["midline"] = self.midline.value()
@@ -1254,10 +1188,10 @@ class MainWindow(QMainWindow):
                 "min": [s.value() for s in self.region_min],
                 "max": [s.value() for s in self.region_max],
             }
-        if before == self._plan_edit_snapshot():
+        if before == self._cut_edit_snapshot():
             return
         self._invalidate()
-        self._remember("Adjust cut region", before, self._plan_edit_snapshot())
+        self._remember("Adjust cut region", before, self._cut_edit_snapshot())
 
     def _plane_dragged(self, origin, normal):
         if self.doc is None or self.loading or self.tabs.currentIndex() != 2:
@@ -1291,15 +1225,15 @@ class MainWindow(QMainWindow):
                 return
             self.doc.fragments = self.pending_fragments
             self.doc.fragments_key = self.doc.configuration_key
-            self.doc.plan.accepted = True
+            self.doc.accept_review()
             self._loaded_meshes[True] = self._fragment_meshes
             self.pending_fragments = None
             self._pending_key = None
             self._fragment_meshes = self._fragment_counts = None
             self._remesh_timer.stop()
             self._mark_dirty()
-            self._cache_active_plan()
-            self._load_plan_selectors()
+            self._cache_active_scene()
+            self._load_scenario_controls()
             if self.tabs.currentIndex() == 3:
                 self._stage_changed(3)
             else:
@@ -1380,13 +1314,13 @@ class MainWindow(QMainWindow):
                     f"That point is {self.doc.fragment_names.get(value, 'background')}; select a point inside {self.doc.fragment_names[expected]}."
                 )
                 return
-            self.doc.plan.confirmations[str(expected)] = self.doc.world_to_plan(
+            self.doc.review.confirmations[self.doc.fragment_descriptors[expected].id] = self.doc.world_to_plan(
                 self.doc.geometry.index_to_world(xyz)
             ).tolist()
             self._mark_dirty()
             self.confirm_label.setText(
                 "Confirmed: "
-                + ", ".join(self.doc.fragment_names[int(i)] for i in self.doc.plan.confirmations)
+                + ", ".join(self.doc.fragment_names[self.doc.fragment_labels[i]] for i in self.doc.review.confirmations if i in self.doc.fragment_labels)
             )
         elif mode == "pivot":
             before = deepcopy(self.doc.scenarios)
@@ -1410,7 +1344,7 @@ class MainWindow(QMainWindow):
                 {
                     "name": f"Point {len(self.doc.scenario.landmarks) + 1}",
                     "point": plan,
-                    "fragment": fragment,
+                    "fragment": self.doc.fragment_descriptors[fragment].id,
                 }
             )
             self._remember(
@@ -1433,9 +1367,8 @@ class MainWindow(QMainWindow):
         from scipy.spatial.transform import Rotation
 
         from .engine import default_cuts
-        from .model import CutPlan
 
-        if any(plan.accepted or plan.confirmations for plan in self.doc.plans.values()) or any(
+        if any(cut.accepted or cut.confirmations for cut in self.doc.cuts.values()) or any(
             m.pivot_set or any(m.translation) or any(m.angles)
             for scenario in self.doc.scenarios.values()
             for m in scenario.motions.values()
@@ -1452,23 +1385,23 @@ class MainWindow(QMainWindow):
                 return
         before = {
             key: deepcopy(getattr(self.doc, key))
-            for key in ("frame", "plans", "scenarios", "active_scenario")
+            for key in ("frame", "cuts", "scenarios", "active_scenario", "reviews")
         }
         self.doc.frame = np.eye(4)
         self.doc.frame[:3, :3] = Rotation.from_euler(
             "xyz", [s.value() for s in self.frame_spins], degrees=True
         ).as_matrix() @ np.diag([-1.0, -1.0, 1.0])
-        self.doc.plans = {"plan1": CutPlan("Le Fort I", cuts=default_cuts(self.doc))}
+        self.doc.cuts = default_cuts(self.doc)
         self.doc.scenarios = {"Scenario 1": new_scenario()}
         self.doc.active_scenario = "Scenario 1"
-        self._invalidate(all_plans=True)
+        self._invalidate(all_anatomy=True)
         after = {key: deepcopy(getattr(self.doc, key)) for key in before}
         self.history.push(Edit("Change reference", [], before, after))
         self._mark_dirty()
         self._load_document_controls()
 
     def _load_motion(self):
-        if self.doc is None:
+        if self.doc is None or self.loading:
             return
         motion = self.doc.motions[self.motion_combo.currentData()]
         self.loading = True
@@ -1530,7 +1463,7 @@ class MainWindow(QMainWindow):
         for landmark in self.doc.scenario.landmarks:
             point = self.doc.plan_to_world(landmark["point"])
             matrix = (
-                transforms.get(landmark["fragment"], np.eye(4))
+                transforms.get(self.doc.fragment_labels.get(landmark["fragment"], 0), np.eye(4))
                 if self.tabs.currentIndex() == 3 and self.doc.fragments is not None
                 else np.eye(4)
             )
@@ -1607,7 +1540,7 @@ class MainWindow(QMainWindow):
         self._finish_motion_edit()
         self.doc.active_scenario = name
         self._mark_dirty()
-        self._activate_plan()
+        self._activate_scene()
 
     def _duplicate_scenario(self):
         if self.doc is None:
@@ -1662,7 +1595,7 @@ class MainWindow(QMainWindow):
             self._fragment_meshes = self._fragment_counts = None
             self._mark_dirty()
             self._load_document_controls()
-            self._activate_plan()
+            self._activate_scene()
 
     def closeEvent(self, event):
         if self.jobs.busy:

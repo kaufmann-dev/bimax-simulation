@@ -24,7 +24,7 @@ CACHE_BYTES = 512 * 1024**2
 _HASH_CHUNK = 4 * 1024**2
 _ENTRY = re.compile(r"[0-9a-f]{64}\.npz")
 _TEMP = re.compile(r"\.[0-9a-f]{64}\.[a-z0-9_]+\.tmp")
-_MEMBER = re.compile(r"([1-8])_(vertices|faces|normals)\.npy")
+_MEMBER = re.compile(r"([1-9]|10)_(vertices|faces|normals)\.npy")
 
 
 def _directory() -> Path:
@@ -63,7 +63,7 @@ def _key(labels: np.ndarray, geometry: Geometry) -> str:
 def _validate_meshes(meshes: dict[int, Mesh]) -> None:
     total = 0
     for label, mesh in meshes.items():
-        if type(label) is not int or label not in range(1, 9):
+        if type(label) is not int or label not in range(1, 11):
             raise ValueError("Invalid cached display label.")
         vertices, faces, normals = mesh.vertices, mesh.faces, mesh.normals
         for array, dtype in ((vertices, np.float32), (faces, np.int32), (normals, np.float32)):

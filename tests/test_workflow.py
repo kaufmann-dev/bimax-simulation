@@ -9,16 +9,18 @@ os.environ.setdefault("QT_QPA_PLATFORM", "xcb")
 import numpy as np
 import pytest
 import SimpleITK as sitk
+from factories import confirm
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QCloseEvent
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QFileDialog, QInputDialog, QMessageBox
 
 from bimax.app import MainWindow
-from bimax.engine import build_fragments, default_cuts, required_fragment_labels
+from bimax.engine import build_fragments, default_cuts
 from bimax.history import Edit, History
 from bimax.jobs import Jobs
-from bimax.model import CutPlan, Document, Geometry, new_scenario
+from bimax.model import Document, Geometry, new_scenario
+from bimax.prepared import prepare_geometry
 from bimax.storage import load_project, save_project
 from bimax.surfaces import make_surfaces
 
@@ -80,10 +82,10 @@ def synthetic_document(assigned=False, fragments=False):
         np.zeros_like(source),
         source_name="synthetic-bone.nii.gz",
     )
-    doc.plan.cuts = default_cuts(doc)
+    doc.cuts = default_cuts(doc)
     if fragments:
         doc.fragments = np.array([0, 8, 1, 5, 7], dtype=np.uint8)[anatomy]
-        doc.plan.accepted = True
+        doc.accept_review()
         doc.fragments_key = doc.configuration_key
     return doc
 
@@ -107,148 +109,95 @@ def install_document(window, doc):
 
 def alternative_document():
     doc = synthetic_document(assigned=True)
-    doc.plans = {}
     doc.scenarios = {}
+    doc.cuts["lefort1"].geometry["planes"]["upper"]["origin"][2] = 18
     for level, genio in ((1, False), (2, True), (3, False)):
         name = f"Le Fort {level}"
-        plan_id = f"lf{level}"
-        cuts = default_cuts(doc, level)
-        cuts["lefort"]["enabled"] = True
-        if level == 1:
-            cuts["lefort"]["planes"]["upper"]["origin"][2] = 18
-        cuts["genio"]["enabled"] = genio
-        doc.plans[plan_id] = CutPlan(name, lefort_level=level, cuts=cuts)
-        doc.scenarios[name] = new_scenario(plan_id)
+        doc.scenarios[name] = new_scenario([f"lefort{level}", *(["genio"] if genio else [])])
         doc.active_scenario = name
-        labels = build_fragments(doc, validate=False)
-        for label in required_fragment_labels(doc.plan):
-            zyx = np.argwhere(labels == label)[0]
-            doc.plan.confirmations[str(label)] = doc.world_to_plan(
-                doc.geometry.index_to_world(zyx[::-1])
-            ).tolist()
-        build_fragments(doc, validate=True)
-        doc.plan.accepted = True
+        result = prepare_geometry(doc)
+        confirm(doc, result["fragments"])
     doc.active_scenario = "Le Fort 1"
     doc.fragments = build_fragments(doc)
     doc.fragments_key = doc.configuration_key
     return doc
 
 
-def test_switching_operation_scenarios_is_lazy_cached_and_keeps_independent_motion(
-    window, monkeypatch
-):
+def test_switching_prepared_scenarios_keeps_independent_motion_and_uses_array_free_loading(window, monkeypatch):
     from bimax.worker import execute
-
     doc = alternative_document()
     install_document(window, doc)
     first_labels = doc.fragments
     requests = []
-    monkeypatch.setattr(
-        window.jobs, "submit", lambda operation, *args, **options: requests.append(operation)
-    )
+    monkeypatch.setattr(window.jobs, "submit", lambda operation, document=None, **options: requests.append((operation, document, options)))
     window.motion_spins[1].setValue(7)
     window._finish_motion_edit()
     window.scenario_combo.setCurrentText("Le Fort 2")
-    assert requests == ["prepare_plan"]
+    assert requests[0][0:2] == ("load_prepared", None)
     assert doc.fragments is None
     assert not window.motion_spins[1].isEnabled()
-    assert window.cut_scenario_combo.currentText() == "Le Fort 2"
-    result = execute("prepare_plan", doc, {})
-    window._job_finished("prepare_plan", doc.revision, result)
+    result = execute(*requests[0])
+    window._job_finished("load_prepared", -1, result)
     assert doc.fragments_key == doc.configuration_key
     assert 6 in window.views.actors
-    assert (
-        window.motion_combo.itemText(window.motion_combo.findData("maxilla")) == "Central midface"
-    )
+    assert window.motion_combo.itemText(window.motion_combo.findData("lefort2")) == "Central midface"
     window.motion_spins[1].setValue(3)
     window._finish_motion_edit()
-    window.cut_scenario_combo.setCurrentText("Le Fort 1")
-    assert requests == ["prepare_plan"]
+    window.scenario_combo.setCurrentText("Le Fort 1")
+    assert len(requests) == 1
     assert doc.fragments is first_labels
     assert doc.motions["linked"].translation[1] == 7
     assert doc.scenarios["Le Fort 2"].motions["linked"].translation[1] == 3
     assert 6 not in window.views.actors
-    chin = window.motion_combo.model().item(window.motion_combo.findData("chin"))
-    assert not chin.isEnabled()
-    window.move_plan_combo.setCurrentIndex(window.move_plan_combo.findData("lf2"))
-    assert doc.scenario.plan_id == "lf2"
-    assert requests == ["prepare_plan"]
-    window._undo(False)
-    assert doc.scenario.plan_id == "lf1"
-    assert doc.fragments is first_labels
-    assert requests == ["prepare_plan"]
-    assert len(window._plan_cache) == 2
+    assert not window.motion_combo.model().item(window.motion_combo.findData("chin")).isEnabled()
 
 
-def test_plan_edit_invalidates_only_linked_geometry_and_landmarks_and_undo_restores(
-    window, monkeypatch
-):
-    from bimax.worker import execute
-
+def test_shared_cut_edit_invalidates_only_using_scenarios_and_undo_restores_cached_scene(window, monkeypatch):
     doc = alternative_document()
-    point = doc.plan.confirmations["2"]
-    doc.scenario.landmarks = [{"name": "A", "point": point, "fragment": 2}]
+    point = doc.review.confirmations["upper:lefort1"]
+    doc.scenario.landmarks = [{"name": "A", "point": point, "fragment": "upper:lefort1"}]
     doc.scenarios["Linked alternative"] = deepcopy(doc.scenario)
-    doc.scenarios["Le Fort 2"].landmarks = [
-        {"name": "B", "point": doc.plans["lf2"].confirmations["2"], "fragment": 2}
-    ]
-    original = deepcopy(doc.plans)
+    doc.scenarios["Le Fort 2"].landmarks = [{"name": "B", "point": doc.cuts["lefort2"].confirmations["upper:lefort2"], "fragment": "upper:lefort2"}]
+    original = deepcopy(doc.cuts)
     install_document(window, doc)
     requests = []
-    monkeypatch.setattr(
-        window.jobs, "submit", lambda operation, *args, **options: requests.append(operation)
-    )
+    monkeypatch.setattr(window.jobs, "submit", lambda operation, *args, **options: requests.append(operation))
     window.tabs.setCurrentIndex(2)
     window.plane_origin[2].setValue(19)
     window.plane_origin[2].editingFinished.emit()
-    assert not doc.plan.accepted
+    assert not doc.cuts["lefort1"].accepted
     assert doc.fragments is None
     assert doc.scenario.landmarks == doc.scenarios["Linked alternative"].landmarks == []
-    assert doc.plans["lf2"] == original["lf2"]
-    assert doc.plans["lf3"] == original["lf3"]
+    assert doc.cuts["lefort2"] == original["lefort2"]
+    assert doc.cuts["lefort3"] == original["lefort3"]
     assert doc.scenarios["Le Fort 2"].landmarks
     window._undo(False)
-    assert doc.plan == original["lf1"]
+    assert doc.cuts == original
     assert doc.scenario.landmarks
-    assert requests == ["prepare_plan"]
-    window._job_finished("prepare_plan", doc.revision, execute("prepare_plan", doc, {}))
     assert doc.fragments_key == doc.configuration_key
+    assert requests == []
 
 
-def test_plan_creation_adds_independent_plan_and_scenario_without_overwriting_original(
-    window, monkeypatch
-):
-    from bimax.worker import execute
-
+def test_scenario_cut_checklist_replaces_same_level_variant_without_duplicating_definitions(window, monkeypatch):
     doc = alternative_document()
     install_document(window, doc)
-    original = deepcopy(doc.plans)
-    requests = []
-    monkeypatch.setattr(QInputDialog, "getItem", lambda *args: ("Le Fort III", True))
-    monkeypatch.setattr(QInputDialog, "getText", lambda *args, **kwargs: ("New LF III", True))
-    monkeypatch.setattr(
-        window.jobs,
-        "submit",
-        lambda operation, document, **options: requests.append((operation, options)),
-    )
-    window._create_plan()
-    operation, options = requests.pop()
-    assert operation == "create_plan"
-    window._job_finished(operation, doc.revision, execute(operation, doc, options))
-    assert doc.active_scenario == "New LF III"
-    assert doc.plan.lefort_level == 3
-    assert not doc.plan.accepted
-    assert len(doc.plans) == 4
-    assert doc.fragments is None
-    for key, value in original.items():
-        assert doc.plans[key] == value
-    assert doc.plan.cuts["bsso"] is not doc.plans["lf1"].cuts["bsso"]
-    assert not requests
+    original = deepcopy(doc.cuts)
+    monkeypatch.setattr(window.jobs, "submit", lambda *args, **kwargs: None)
+    window.tabs.setCurrentIndex(2)
+    window.cut_checks["lefort2"].setChecked(True)
+    window.cut_checks["modified-lefort2"].setChecked(True)
+    assert "modified-lefort2" in doc.scenario.cut_ids
+    assert "lefort2" not in doc.scenario.cut_ids
+    assert doc.cuts == original
+    assert len(doc.cuts) == 7
+    assert len(doc.scenarios) == 3
+    assert not hasattr(window, "cut_plan_combo")
+    assert not hasattr(window, "move_plan_combo")
+    assert not hasattr(window, "cut_scenario_combo")
 
 
-def test_different_plan_result_and_pending_preview_cannot_be_accepted(window, monkeypatch):
+def test_different_geometry_result_and_pending_preview_cannot_be_accepted(window, monkeypatch):
     from bimax.worker import execute
-
     doc = alternative_document()
     install_document(window, doc)
     old_result = execute("cuts_preview", doc, {})
@@ -256,7 +205,7 @@ def test_different_plan_result_and_pending_preview_cannot_be_accepted(window, mo
     window.scenario_combo.setCurrentText("Le Fort 2")
     window._job_finished("cuts_preview", doc.revision, old_result)
     assert window.pending_fragments is None
-    assert "different cut plan" in window.statusBar().currentMessage()
+    assert "different cuts or anatomy" in window.statusBar().currentMessage()
     window.pending_fragments = old_result["fragments"]
     window._fragment_counts = old_result["fragment_counts"]
     window._pending_key = old_result["configuration_key"]
@@ -270,7 +219,7 @@ def test_separation_hint_edits_and_undo_preserve_all_accepted_plans(
 ):
     doc = alternative_document()
     install_document(window, doc)
-    plans = deepcopy(doc.plans)
+    plans = deepcopy(doc.cuts)
     labels = doc.fragments
     key = doc.configuration_key
     window.tabs.setCurrentIndex(1)
@@ -279,14 +228,14 @@ def test_separation_hint_edits_and_undo_preserve_all_accepted_plans(
     )
     indices = np.array([np.ravel_multi_index((5, 5, 5), doc.geometry.shape)])
     window._apply_array_edit("Edit hint", field, indices, value)
-    assert doc.plans == plans
+    assert doc.cuts == plans
     assert doc.fragments is labels
     assert doc.configuration_key == key
     window._undo(False)
-    assert doc.plans == plans
+    assert doc.cuts == plans
     assert doc.fragments is labels
     window._undo(True)
-    assert doc.plans == plans
+    assert doc.cuts == plans
     assert doc.fragments is labels
 
 
@@ -363,14 +312,14 @@ def test_cut_acceptance_reuses_preview_and_cut_edit_discards_actors(window, monk
     from bimax.worker import execute
 
     doc = synthetic_document(assigned=True)
-    doc.plan.cuts["lefort"]["enabled"] = True
-    doc.plan.cuts["lefort"]["planes"]["upper"]["origin"][2] = 18
+    doc.scenario.cut_ids = ["lefort1"]
+    doc.cuts["lefort1"].geometry["planes"]["upper"]["origin"][2] = 18
     install_document(window, doc)
     window.tabs.setCurrentIndex(2)
     result = execute("cuts_preview", doc, {})
     window._job_finished("cuts_preview", doc.revision, result)
     xyz = np.argwhere(result["fragments"] == 2)[0][::-1]
-    doc.plan.confirmations["2"] = doc.world_to_plan(doc.geometry.index_to_world(xyz)).tolist()
+    doc.review.confirmations["upper:lefort1"] = doc.world_to_plan(doc.geometry.index_to_world(xyz)).tolist()
     actor = window.views.actors[2]
     monkeypatch.setattr(
         window.jobs, "submit", lambda *args, **kwargs: pytest.fail("accept must reuse preview")
@@ -381,7 +330,7 @@ def test_cut_acceptance_reuses_preview_and_cut_edit_discards_actors(window, monk
     assert window.views.actors[2] is actor
     assert window.tabs.currentIndex() == 3
     window.tabs.setCurrentIndex(2)
-    window.cut_enabled.setChecked(False)
+    window.cut_checks["lefort1"].setChecked(False)
     assert doc.fragments is None
     assert not window.views.fragment_mode
     assert set(window.views.actors) == {2, 3}
@@ -466,10 +415,10 @@ def test_native_import_separate_cut_move_save_reopen_export(window, qapp, tmp_pa
     assert window.doc.fragments is None
 
     window.tabs.setCurrentIndex(2)
-    for operation in ("lefort", "bsso", "genio"):
+    for operation in ("lefort1", "bsso", "genio"):
         window.operation_combo.setCurrentIndex(window.operation_combo.findData(operation))
-        window.cut_enabled.setChecked(True)
-        if operation == "lefort":
+        window.cut_checks[operation].setChecked(True)
+        if operation == "lefort1":
             window.plane_origin[2].setValue(18)
             window.plane_origin[2].editingFinished.emit()
     window.cut_preview_button.click()
@@ -492,7 +441,7 @@ def test_native_import_separate_cut_move_save_reopen_export(window, qapp, tmp_pa
         window.confirm_combo.setCurrentIndex(window.confirm_combo.findData(label))
         window._arm_pick("confirm")
         window.views.pointPicked.emit(point.tolist())
-        assert str(label) in window.doc.plan.confirmations
+        assert window.doc.fragment_descriptors[label].id in window.doc.review.confirmations
     window.accept_cuts_button.click()
     wait_until(qapp, lambda: not window.jobs.busy)
     assert window._test_errors == []
@@ -586,7 +535,7 @@ def test_reset_pivot_preserves_translation_other_controls_and_saved_state(window
     selected.translation = [2.0, 7.0, -3.0]
     selected.angles = [12.0, 4.0, -2.0]
     selected.pivot, selected.pivot_set = [-12.0, -10.0, 9.0], True
-    other = doc.motions["maxilla"]
+    other = doc.motions["lefort1"]
     other.translation, other.angles = [1.0, 4.0, 0.0], [3.0, 0.0, 0.0]
     other.pivot, other.pivot_set = [-9.0, -8.0, 15.0], True
     doc.scenarios["Alternative"] = deepcopy(doc.scenario)
@@ -604,7 +553,7 @@ def test_reset_pivot_preserves_translation_other_controls_and_saved_state(window
     assert selected.angles == selected.pivot == [0.0, 0.0, 0.0]
     assert not selected.pivot_set
     assert doc.scenarios["Alternative"] == before["Alternative"]
-    for key in ("linked", "maxilla", "chin"):
+    for key in ("linked", "lefort1", "chin"):
         assert doc.motions[key] == before["Scenario 1"].motions[key]
     np.testing.assert_array_equal(doc.fragments, accepted)
     assert window.dirty
@@ -756,12 +705,12 @@ def test_boundary_confirmation_snaps_only_for_3d_surface_pick(window, surface_pi
     if surface_pick:
         window.views.last_pick_fragment = 5
         window.views.pointPicked.emit(point.tolist())
-        assert "5" in doc.plan.confirmations
-        voxel_center = doc.plan_to_world(doc.plan.confirmations["5"])
+        assert "mandible" in doc.review.confirmations
+        voxel_center = doc.plan_to_world(doc.review.confirmations["mandible"])
         np.testing.assert_allclose(voxel_center, [3, 8, 5])
     else:
         window.views._point_picked(point.tolist())
-        assert doc.plan.confirmations == {}
+        assert doc.review.confirmations == {}
 
 
 @pytest.mark.parametrize("surface_pick", [False, True])
@@ -778,7 +727,7 @@ def test_boundary_landmark_preserves_surface_point_without_assigning_background(
         window.views.last_pick_fragment = 5
         window.views.pointPicked.emit(point.tolist())
         assert len(doc.scenario.landmarks) == 1
-        assert doc.scenario.landmarks[0]["fragment"] == 5
+        assert doc.scenario.landmarks[0]["fragment"] == "mandible"
         np.testing.assert_allclose(doc.plan_to_world(doc.scenario.landmarks[0]["point"]), point)
     else:
         window.views._point_picked(point.tolist())
@@ -794,7 +743,7 @@ def test_surface_confirmation_does_not_snap_to_a_different_fragment(window):
     window._arm_pick("confirm")
     window.views.last_pick_fragment = 1
     window.views.pointPicked.emit([2.49, 8.0, 5.0])
-    assert doc.plan.confirmations == {}
+    assert doc.review.confirmations == {}
 
 
 def test_frame_undo_and_duplicate_scenario_remain_valid(window, qapp, monkeypatch):
@@ -927,3 +876,71 @@ def test_failed_open_preserves_previous_project_save_target(window, qapp, tmp_pa
     assert window._test_errors
     assert window.doc is doc
     assert window.project_path == previous
+
+
+def test_byte_budget_eviction_reloads_saved_geometry_without_preparing(window, monkeypatch):
+    from bimax.worker import execute
+    doc = alternative_document()
+    # Force every scene out of the memory cache, while retaining disk artifacts.
+    monkeypatch.setattr("bimax.app.SCENE_CACHE_BYTES", 1)
+    install_document(window, doc)
+    assert not window._scene_cache
+    requests = []
+    def submit(operation, document=None, **options):
+        requests.append((operation, document, options))
+    monkeypatch.setattr(window.jobs, "submit", submit)
+    def unexpected(*args, **kwargs):
+        pytest.fail("Evicted prepared scenes must not cut volumes or extract meshes")
+    monkeypatch.setattr("bimax.prepared.cut_membership", unexpected)
+    monkeypatch.setattr("bimax.surfaces.make_surfaces", unexpected)
+    for name in ("Le Fort 2", "Le Fort 3", "Le Fort 1", "Le Fort 2"):
+        window.scenario_combo.setCurrentText(name)
+        operation, document, options = requests[-1]
+        assert operation == "load_prepared"
+        assert document is None
+        window._job_finished(operation, -1, execute(operation, document, options))
+        assert doc.fragments_key == doc.configuration_key
+        assert not window._scene_cache
+    assert len(requests) == 4
+    assert window._test_errors == []
+
+
+def test_editing_an_unused_shared_cut_preserves_the_active_scene(window, monkeypatch):
+    doc = alternative_document()
+    install_document(window, doc)
+    original = doc.fragments
+    window.tabs.setCurrentIndex(2)
+    window.operation_combo.setCurrentIndex(window.operation_combo.findData("lefort3"))
+    monkeypatch.setattr(window.jobs, "submit", lambda *args, **kwargs: pytest.fail("Unused edits must not rebuild the active scene"))
+    window.plane_origin[2].setValue(window.plane_origin[2].value() + 1)
+    window.plane_origin[2].editingFinished.emit()
+    assert doc.fragments is original
+    assert doc.cuts_accepted
+    assert not doc.cuts["lefort3"].accepted
+
+
+def test_replaced_document_rejects_old_prepared_result_before_importing_its_fingerprint(window):
+    from bimax.worker import execute
+    old = alternative_document()
+    result = execute("cuts_preview", old, {})
+    current = synthetic_document(assigned=True)
+    install_document(window, current)
+    old_digest = current._anatomy_digest
+    window._job_finished("cuts_preview", current.revision, result)
+    assert window.pending_fragments is None
+    assert current._anatomy_digest == old_digest
+    assert "different document" in window.statusBar().currentMessage()
+
+
+def test_anatomy_painting_defers_full_fingerprint_to_the_worker(window, monkeypatch):
+    doc = alternative_document()
+    install_document(window, doc)
+    window.tabs.setCurrentIndex(1)
+    def unexpected(_doc):
+        pytest.fail("Painting must not hash the whole anatomy on the GUI thread")
+    monkeypatch.setattr(Document, "anatomy_key", property(unexpected))
+    index = np.array([np.ravel_multi_index((5, 5, 5), doc.geometry.shape)])
+    window._apply_array_edit("Exclude bone", "anatomy", index, 4)
+    assert doc.fragments is None
+    assert not doc.cuts_accepted
+    window._remesh_timer.stop()

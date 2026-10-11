@@ -33,7 +33,8 @@ def phantom(reflected=False):
         barriers=np.zeros_like(expected),
         source_name="original-bone.nii.gz",
     )
-    doc.plan.cuts = default_cuts(doc)
+    doc.cuts = default_cuts(doc)
+    doc.scenario.cut_ids = ["lefort1", "genio"]
     matrix = doc.frame @ doc.geometry.affine
 
     def plane(origin, normal):
@@ -42,22 +43,20 @@ def phantom(reflected=False):
             "normal": (np.linalg.inv(matrix[:3, :3]).T @ normal).tolist(),
         }
 
-    doc.plan.cuts["lefort"] = {
-        "enabled": True,
+    doc.cuts["lefort1"].geometry = {
         "planes": {"upper": plane([7, 0, 0], [1, 0, 0])},
         "groups": [["upper"]],
         "region": {"min": [-100.0] * 3, "max": [100.0] * 3},
     }
-    doc.plan.cuts["genio"] = {
-        "enabled": True,
+    doc.cuts["genio"].geometry = {
         "plane": plane([0, 0, 8.5], [0, 0, 1]),
         "region": {"min": [-100.0] * 3, "max": [100.0] * 3},
     }
-    doc.plan.confirmations = {
-        str(label): doc.world_to_plan(geometry.index_to_world(xyz)).tolist()
+    doc.review.confirmations = {
+        doc.fragment_descriptors[label].id: doc.world_to_plan(geometry.index_to_world(xyz)).tolist()
         for label, xyz in ((2, [9, 3, 2]), (5, [5, 5, 6]), (6, [5, 5, 9]))
     }
-    doc.plan.accepted = True
+    doc.accept_review()
     doc.fragments = build_fragments(doc)
     doc.fragments_key = doc.configuration_key
     np.testing.assert_array_equal(doc.fragments, expected)
@@ -70,17 +69,17 @@ def test_project_roundtrip_preserves_shared_anatomy_plans_and_scenarios(tmp_path
     doc.seeds[2, 3, 2] = 2
     doc.barriers[2, 3, 3] = 1
     for level in (2, 3):
-        plan_id = f"lf{level}"
-        doc.plans[plan_id] = deepcopy(doc.plan)
-        doc.plans[plan_id].name = f"Le Fort {level} without chin"
-        doc.plans[plan_id].lefort_level = level
-        doc.plans[plan_id].cuts["genio"]["enabled"] = False
-        doc.plans[plan_id].confirmations.pop("6")
-        doc.plans[plan_id].revision = level
-        doc.scenarios[f"Le Fort {level}"] = new_scenario(plan_id)
-    doc.scenarios["Advance"] = new_scenario("plan1")
+        key = f"lefort{level}"
+        doc.cuts[key].geometry = deepcopy(doc.cuts["lefort1"].geometry)
+        doc.cuts[key].confirmations = {f"upper:{key}": list(doc.cuts["lefort1"].confirmations["upper:lefort1"])}
+        doc.cuts[key].accepted = True
+        doc.cuts[key].revision = level
+        doc.scenarios[f"Le Fort {level}"] = new_scenario([key])
+        doc.active_scenario = f"Le Fort {level}"
+        doc.review.accepted = True
+    doc.scenarios["Advance"] = new_scenario(["lefort1", "genio"])
     doc.active_scenario = "Advance"
-    doc.scenario.landmarks = [{"name": "Maxillary reference", "point": [1.2, 3.4, 5.6], "fragment": 2}]
+    doc.scenario.landmarks = [{"name": "Maxillary reference", "point": [1.2, 3.4, 5.6], "fragment": "upper:lefort1"}]
     doc.motions["linked"].translation = [1.0, 6.0, -2.0]
     doc.motions["mandible"].angles = [12.0, 3.0, -4.0]
     doc.motions["chin"].pivot = [3.0, -4.0, 5.0]
@@ -94,23 +93,23 @@ def test_project_roundtrip_preserves_shared_anatomy_plans_and_scenarios(tmp_path
     assert restored.geometry == doc.geometry
     for name in ("source", "anatomy", "seeds", "barriers", "frame"):
         np.testing.assert_array_equal(getattr(restored, name), getattr(doc, name))
-    for name in ("plans", "scenarios", "active_scenario", "anatomy_revision", "source_name", "revision"):
+    for name in ("cuts", "scenarios", "active_scenario", "anatomy_revision", "source_name", "revision"):
         assert getattr(restored, name) == getattr(doc, name)
     assert restored.fragments is None
     assert restored.fragments_key is None
     assert not restored.source.flags.writeable
     with zipfile.ZipFile(path) as archive:
-        assert set(archive.namelist()) == {
+        assert {name for name in archive.namelist() if not name.startswith("artifacts/")} == {
             "project.json", "volumes/source.nii.gz", "volumes/anatomy.nii.gz",
             "volumes/seeds.nii.gz", "volumes/barriers.nii.gz",
         }
-        assert json.loads(archive.read("project.json"))["version"] == 2
+        assert json.loads(archive.read("project.json"))["version"] == 3
     restored.motions["linked"].translation[0] = 100
     restored.scenario.landmarks[0]["point"][0] = 100
     assert restored.scenarios["Scenario 1"].motions["linked"].translation == [0.0, 0.0, 0.0]
     assert restored.scenarios["Scenario 1"].landmarks == []
-    restored.plans["lf2"].cuts["lefort"]["planes"]["upper"]["origin"][0] = 100
-    assert restored.plans["lf3"].cuts == doc.plans["lf3"].cuts
+    restored.cuts["lefort2"].geometry["planes"]["upper"]["origin"][0] = 100
+    assert restored.cuts["lefort3"].geometry == doc.cuts["lefort3"].geometry
     assert doc.motions["linked"].translation == [1.0, 6.0, -2.0]
 
 
@@ -118,13 +117,16 @@ def test_unfinished_project_can_save_without_fragments(tmp_path):
     doc = phantom()
     doc.fragments = None
     doc.fragments_key = None
-    doc.plan.accepted = False
-    doc.plan.confirmations.clear()
+    for cut in doc.cuts.values():
+        cut.accepted = False
+        cut.confirmations.clear()
+    doc.reviews.clear()
+    doc.anatomy_revision += 1
     doc.anatomy[doc.source != 0] = 1
     save_project(doc, tmp_path / "unfinished.bimax")
     restored = load_project(tmp_path / "unfinished.bimax")
     assert restored.fragments is None
-    assert not restored.plan.accepted
+    assert not restored.cuts["lefort1"].accepted
     np.testing.assert_array_equal(restored.anatomy, doc.anatomy)
 
 
@@ -143,9 +145,9 @@ def test_invalid_volume_partition_cannot_replace_saved_project(tmp_path, corrupt
     elif corruption == "seed":
         doc.seeds[2, 3, 2] = 1
     elif corruption == "stale":
-        doc.plan.revision += 1
+        doc.cuts["lefort1"].geometry["planes"]["upper"]["origin"][0] += 1
     elif corruption == "unreviewed":
-        doc.plan.accepted = False
+        doc.cuts["lefort1"].accepted = False
     else:
         doc.source[2, 3, 2] = 2
     with pytest.raises(ValueError):
@@ -167,7 +169,7 @@ def rewrite_archive(path, transform_metadata=None, extra=None):
             archive.writestr(name, content)
 
 
-@pytest.mark.parametrize("corruption", ["traversal", "nan", "geometry", "motion", "landmark", "plan_ref", "active", "level", "reviews", "plane", "group", "empty_group", "old_version", "fragments"])
+@pytest.mark.parametrize("corruption", ["traversal", "nan", "geometry", "motion", "landmark", "cut_ref", "active", "level", "reviews", "plane", "group", "empty_group", "old_version", "fragments"])
 def test_malformed_archive_is_rejected(tmp_path, corruption):
     path = tmp_path / "plan.bimax"
     save_project(phantom(), path)
@@ -181,13 +183,13 @@ def test_malformed_archive_is_rejected(tmp_path, corruption):
             "geometry": lambda m: m["geometry"]["shape"].__setitem__(0, 99),
             "motion": lambda m: m["scenarios"]["Scenario 1"]["motions"]["linked"].pop("pivot"),
             "landmark": lambda m: m["scenarios"]["Scenario 1"]["landmarks"].append({"name": "Broken"}),
-            "plan_ref": lambda m: m["scenarios"]["Scenario 1"].__setitem__("plan_id", "missing"),
+            "cut_ref": lambda m: m["scenarios"]["Scenario 1"].__setitem__("cut_ids", ["missing"]),
             "active": lambda m: m.__setitem__("active_scenario", "missing"),
-            "level": lambda m: m["plans"]["plan1"].__setitem__("lefort_level", 4),
-            "reviews": lambda m: m["plans"]["plan1"]["confirmations"].pop("2"),
-            "plane": lambda m: m["plans"]["plan1"]["cuts"]["lefort"]["planes"]["upper"].__setitem__("normal", [0, 0, 0]),
-            "group": lambda m: m["plans"]["plan1"]["cuts"]["lefort"].__setitem__("groups", [["missing"]]),
-            "empty_group": lambda m: m["plans"]["plan1"]["cuts"]["lefort"].__setitem__("groups", [[]]),
+            "level": lambda m: m["cuts"]["lefort1"].__setitem__("level", 4),
+            "reviews": lambda m: m["cuts"]["lefort1"]["confirmations"].pop("upper:lefort1"),
+            "plane": lambda m: m["cuts"]["lefort1"]["geometry"]["planes"]["upper"].__setitem__("normal", [0, 0, 0]),
+            "group": lambda m: m["cuts"]["lefort1"]["geometry"].__setitem__("groups", [["missing"]]),
+            "empty_group": lambda m: m["cuts"]["lefort1"]["geometry"].__setitem__("groups", [[]]),
             "old_version": lambda m: m.__setitem__("version", 1),
         }
         rewrite_archive(path, changes[corruption])
@@ -200,7 +202,7 @@ def test_version_one_rejection_explains_new_format(tmp_path):
     path = tmp_path / "old.bimax"
     save_project(phantom(), path)
     rewrite_archive(path, lambda metadata: metadata.__setitem__("version", 1))
-    with pytest.raises(ValueError, match="version 2 project"):
+    with pytest.raises(ValueError, match="version 3 project"):
         load_project(path)
 
 
@@ -208,8 +210,10 @@ def test_inactive_accepted_plan_reviews_are_validated_without_building_volumes(t
     import bimax.engine
 
     doc = phantom()
-    doc.plans["inactive"] = deepcopy(doc.plan)
-    doc.plans["inactive"].name = "Inactive plan"
+    doc.cuts["lefort3"].name = "Inactive cut"
+    doc.cuts["lefort3"].geometry = deepcopy(doc.cuts["lefort1"].geometry)
+    doc.cuts["lefort3"].accepted = True
+    doc.cuts["lefort3"].confirmations = {"upper:lefort3": list(doc.cuts["lefort1"].confirmations["upper:lefort1"])}
     doc.fragments = None
     doc.fragments_key = None
     path = tmp_path / "plan.bimax"
@@ -223,9 +227,9 @@ def test_inactive_accepted_plan_reviews_are_validated_without_building_volumes(t
     assert restored.fragments is None
     rewrite_archive(
         path,
-        lambda metadata: metadata["plans"]["inactive"]["confirmations"].__setitem__("2", [999, 999, 999]),
+        lambda metadata: metadata["cuts"]["lefort3"]["confirmations"].__setitem__("upper:lefort3", [999, 999, 999]),
     )
-    with pytest.raises(ValueError, match="Inactive plan.*outside"):
+    with pytest.raises(ValueError, match="Inactive cut.*outside"):
         load_project(path)
 
 
@@ -243,11 +247,8 @@ def test_identity_export_preserves_masks_and_adds_shared_border(tmp_path):
     source = doc.source.copy()
     manifest, images = read_export(export_labelmaps(doc, tmp_path / "export"))
     assert set(images) == {1, 2, 5, 6, 7}
-    assert manifest["plan"] == {
-        "id": "plan1", "name": "Le Fort I", "lefort_level": 1,
-        "lefort": True, "bsso": False, "genioplasty": True,
-        "revision": 0, "anatomy_revision": 0,
-    }
+    assert [(cut["id"], cut["kind"]) for cut in manifest["cuts"]] == [("lefort1", "lefort"), ("genio", "genio")]
+    assert all("identity" in fragment for fragment in manifest["fragments"])
     geometry = manifest["geometry"]
     for label, image in images.items():
         np.testing.assert_allclose(image.GetSpacing(), doc.geometry.spacing)
@@ -266,7 +267,7 @@ def test_identity_export_preserves_masks_and_adds_shared_border(tmp_path):
 def test_export_preserves_overlap_in_separate_files(tmp_path):
     doc = phantom()
     delta_lps = doc.geometry.affine[:3, :3] @ [-7, 0, 0]
-    doc.motions["maxilla"].translation = (doc.frame[:3, :3] @ delta_lps).tolist()
+    doc.motions["lefort1"].translation = (doc.frame[:3, :3] @ delta_lps).tolist()
     manifest, images = read_export(export_labelmaps(doc, tmp_path / "overlap"))
     np.testing.assert_array_equal(sitk.GetArrayFromImage(images[1]), sitk.GetArrayFromImage(images[2]))
     moved = next(item for item in manifest["fragments"] if item["id"] == 2)
@@ -302,13 +303,12 @@ def test_rotation_translation_export_has_no_clipping(tmp_path):
 
 def test_export_rebuilds_only_active_accepted_plan_after_loading(tmp_path):
     doc = phantom()
-    doc.plans["lf3"] = deepcopy(doc.plan)
-    doc.plans["lf3"].lefort_level = 3
-    doc.plans["lf3"].name = "Le Fort III without genioplasty"
-    doc.plans["lf3"].cuts["genio"]["enabled"] = False
-    doc.plans["lf3"].confirmations.pop("6")
-    doc.scenarios["Third"] = new_scenario("lf3")
+    doc.cuts["lefort3"].geometry = deepcopy(doc.cuts["lefort1"].geometry)
+    doc.cuts["lefort3"].confirmations = {"upper:lefort3": list(doc.cuts["lefort1"].confirmations["upper:lefort1"])}
+    doc.cuts["lefort3"].accepted = True
+    doc.scenarios["Third"] = new_scenario(["lefort3"])
     doc.active_scenario = "Third"
+    doc.review.accepted = True
     doc.fragments = None
     doc.fragments_key = None
     save_project(doc, tmp_path / "plan.bimax")
@@ -316,24 +316,24 @@ def test_export_rebuilds_only_active_accepted_plan_after_loading(tmp_path):
     assert restored.fragments is None
     manifest, images = read_export(export_labelmaps(restored, tmp_path / "export"))
     assert set(images) == {1, 2, 5, 7}
-    assert manifest["plan"]["id"] == "lf3"
-    assert manifest["plan"]["lefort_level"] == 3
-    assert not manifest["plan"]["genioplasty"]
+    assert manifest["cuts"][0]["id"] == "lefort3"
+    assert manifest["cuts"][0]["level"] == 3
+    assert len(manifest["cuts"]) == 1
     assert next(item for item in manifest["fragments"] if item["id"] == 2)["name"] == "Midface"
     assert restored.fragments_key == restored.configuration_key
-    assert restored.plans["plan1"].cuts["genio"]["enabled"]
+    assert restored.cuts["genio"].accepted
 
 
 def test_export_rejects_unassigned_unreviewed_and_stale_fragments(tmp_path):
     doc = phantom()
     unreviewed = deepcopy(doc)
-    unreviewed.plan.accepted = False
+    unreviewed.review.accepted = False
     unreviewed.fragments = None
     unreviewed.fragments_key = None
     with pytest.raises(ValueError, match="Build and review"):
         export_labelmaps(unreviewed, tmp_path / "export")
     stale = deepcopy(doc)
-    stale.anatomy_revision += 1
+    stale.cuts["lefort1"].geometry["planes"]["upper"]["origin"][0] += 1
     with pytest.raises(ValueError, match="stale"):
         export_labelmaps(stale, tmp_path / "export")
     doc.anatomy[2, 3, 2] = 1
@@ -364,3 +364,27 @@ def test_failed_export_never_publishes_partial_output(tmp_path, monkeypatch):
     with pytest.raises(RuntimeError, match="disk failure"):
         export_labelmaps(phantom(), tmp_path / "export")
     assert list(tmp_path.iterdir()) == []
+
+
+def test_nested_export_preserves_fragment_identity_and_parent_relative_transforms(tmp_path):
+    from factories import confirm, document, upper_geometry
+
+    from bimax.engine import fragment_transforms
+    from bimax.prepared import prepare_geometry
+    doc = document()
+    for level, height in ((1, 11), (2, 14), (3, 17)):
+        doc.cuts[f"lefort{level}"].geometry = upper_geometry(height)
+    doc.scenario.cut_ids = ["lefort3", "lefort2", "lefort1", "bsso", "genio"]
+    result = prepare_geometry(doc)
+    confirm(doc, result["fragments"])
+    doc.fragments, doc.fragments_key = result["fragments"], doc.configuration_key
+    doc.motions["lefort3"].translation = [0, 2, 0]
+    doc.motions["lefort1"].translation = [0, 3, 0]
+    transforms = fragment_transforms(doc)
+    manifest, images = read_export(export_labelmaps(doc, tmp_path / "nested"))
+    assert {2, 9, 10} <= set(images)
+    identities = {item["identity"] for item in manifest["fragments"]}
+    assert {"upper:lefort1", "upper:lefort2", "upper:lefort3"} <= identities
+    for item in manifest["fragments"]:
+        np.testing.assert_allclose(item["transform_lps"], transforms[item["id"]])
+        assert item["anatomy"] == doc.fragment_descriptors[item["id"]].anatomy

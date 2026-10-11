@@ -2,7 +2,7 @@
 
 Explore jaw movements in 3D from a binary bone volume. BIMAX is a Linux desktop app for separating the upper and lower jaws, defining geometric cuts, and comparing movement scenarios in slice and 3D views.
 
-It supports Le Fort I, II and III cut plans, bilateral sagittal split osteotomy (BSSO), and genioplasty. This is a geometric simulation: it does not predict fractures, bite, or soft-tissue behavior.
+It supports reusable Le Fort I, II and III cuts, editable modified II and III variants, bilateral sagittal split osteotomy (BSSO), and genioplasty. Nested upper-jaw cuts can be combined, such as Le Fort III + I. This is a geometric simulation: it does not predict fractures, bite, or soft-tissue behavior.
 
 ## Install
 
@@ -69,10 +69,12 @@ bimax /path/to/bone.nii.gz
 
 1. **Import** your bone mask and adjust the head reference frame before placing cuts or movement pivots.
 2. **Separate** the skull and upper teeth from the mandible and lower teeth. Paint seeds, preview the separation, correct fused contacts with assignment or barrier tools, then accept it.
-3. **Cut** the anatomy using a cut plan. Adjust the planes, preview the fragments, confirm the required pieces, and accept the result.
-4. **Move** the jaws together or adjust the upper jaw, distal mandible, and chin individually. Set pivots, translations, and rotations; duplicate scenarios to compare alternatives. The BSSO proximal pieces remain fixed.
+3. **Cut** by selecting shared cuts for the active scenario. Edit each cut’s planes once, preview the combination, confirm any new pieces, and accept it. Cut edits affect every scenario using that cut.
+4. **Move** the jaws together or adjust each upper-jaw fragment, distal mandible, and chin individually. Set pivots, translations, and rotations; duplicate scenarios to compare alternatives. The BSSO proximal pieces remain fixed.
 
-Scenarios can share a cut plan. Create an independent cut plan when you want to compare different cuts rather than just different movements.
+The scenario selector above the workflow tabs chooses a saved cut combination and its movements. Segmentation and the seven cut definitions are shared across the project. Select at most one variant per Le Fort level; combined upper-jaw cuts must be nested and leave nonempty pieces. In Le Fort III + I, moving the midface carries the maxilla, and the maxilla control adds relative movement.
+
+Each cut mask and each used combination is prepared once. Switching prepared scenarios loads saved fragment assignments and display meshes, including after reopening a project or evicting geometry from memory. A new combination needs preparation once; editing a cut invalidates only combinations using it. Anatomy or reference changes invalidate all dependent geometry.
 
 Press **F11** to expand the 3D view and **1** for the right-profile view. Use **Ctrl+Z** to undo and **Ctrl+Shift+Z** to redo edits.
 
@@ -80,13 +82,15 @@ Drag in the 3D view to orbit while keeping the head upright. Middle-drag pans an
 
 ## Save and export
 
-**Save** (`Ctrl+S`) stores the volume, anatomy edits, cut plans, and scenarios in a portable `.bimax` project. Reopen it with **Open project** or:
+**Save** (`Ctrl+S`) stores the volume, anatomy edits, shared cuts, scenarios, and prepared geometry in a portable `.bimax` project. Reopen it with **Open project** or:
 
 ```sh
 bimax /path/to/simulation.bimax
 ```
 
-**Export fragment labelmaps** writes separate binary `.nii.gz` files on a shared physical grid, plus a `manifest.json` describing the fragments and transforms. Review and accept the active cut plan, and assign or explicitly exclude all bone voxels before exporting.
+Projects use `.bimax` format version 3. Older formats require a one-time conversion; they are not loaded by this version.
+
+**Export fragment labelmaps** writes separate binary `.nii.gz` files on a shared physical grid, plus a `manifest.json` describing the fragments and transforms. Review and accept the active cut combination, and assign or explicitly exclude all bone voxels before exporting.
 
 **Export scenario images** writes right, left, front and bird's-eye PNGs plus a labeled contact sheet for the active scenario. Bird's-eye looks down toward the face from 40° above the front. The images use the visible moved bone surfaces and the corrected head reference frame; they do not model soft-tissue appearance.
 

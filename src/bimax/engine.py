@@ -11,7 +11,7 @@ import SimpleITK as sitk
 from scipy import ndimage as ndi
 from skimage.segmentation import watershed
 
-from bimax.model import CutPlan, Document, Geometry, Motion
+from bimax.model import CUT_TYPES, Cut, Document, Geometry, Motion
 
 Progress = Callable[[float, str], None] | None
 MEMORY_BUDGET = 16 * 1024**3
@@ -144,7 +144,7 @@ def load_volume(path: str | Path, progress: Progress = None) -> Document:
         barriers=np.zeros(source.shape, dtype=bool),
         source_name=path.name,
     )
-    doc.plan.cuts = default_cuts(doc)
+    doc.cuts = default_cuts(doc)
     _report(progress, 1.0, "Binary bone volume ready")
     return doc
 
@@ -160,7 +160,7 @@ def planning_bounds(doc: Document) -> tuple[np.ndarray, np.ndarray]:
     return points.min(axis=0), points.max(axis=0)
 
 
-def default_cuts(doc: Document, lefort_level: int = 1) -> dict[str, Any]:
+def default_cut_geometry(doc: Document, lefort_level: int = 1) -> dict[str, Any]:
     """Approximate editable envelopes, disabled until deliberately selected.
 
     Higher-level templates are piecewise planar regions, not single raised
@@ -227,17 +227,27 @@ def default_cuts(doc: Document, lefort_level: int = 1) -> dict[str, Any]:
         }
     return {
         "lefort": {
-            "enabled": False,
             "planes": upper_planes,
             "groups": groups,
             "region": region([low[0], low[1] + extent[1] * 0.35, low[2]], high),
         },
-        "bsso": {"enabled": False, "midline": float(centre[0]), **sides},
+        "bsso": {"midline": float(centre[0]), **sides},
         "genio": {
-            "enabled": False,
             "plane": plane([centre[0], centre[1], low[2] + extent[2] * 0.13], [0, 0, -1]),
             "region": region([low[0], low[1] + extent[1] * 0.50, low[2]], high),
         },
+    }
+
+
+
+def default_cuts(doc: Document) -> dict[str, Cut]:
+    """Seven project-local cut definitions; selecting them belongs to scenarios."""
+    templates = {level: default_cut_geometry(doc, level) for level in (1, 2, 3)}
+    from copy import deepcopy
+
+    return {
+        key: Cut(name, kind, level, deepcopy(templates[level or 1][kind]))
+        for key, (name, kind, level) in CUT_TYPES.items()
     }
 
 
@@ -395,49 +405,60 @@ def label_counts(labels: np.ndarray, maximum_label: int) -> np.ndarray:
     return counts
 
 
-def required_fragment_labels(plan: CutPlan) -> set[int]:
-    required = set()
-    if plan.cuts.get("lefort", {}).get("enabled", False):
-        required.add(2)
-    if plan.cuts.get("bsso", {}).get("enabled", False):
+def required_fragment_labels(doc: Document) -> set[int]:
+    required = {label for label, fragment in doc.fragment_descriptors.items()
+                if fragment.cut_id in doc.upper_cuts}
+    if "bsso" in doc.scenario.cut_ids:
         required.update((3, 4, 5))
-    if plan.cuts.get("genio", {}).get("enabled", False):
+    if "genio" in doc.scenario.cut_ids:
         required.update((5, 6))
     return required
 
 
+def cut_membership(points: tuple[np.ndarray, ...], cut: Cut) -> dict[str, np.ndarray]:
+    """Evaluate one immutable cut definition on its anatomical parent."""
+    geometry = cut.geometry
+    if cut.kind == "lefort":
+        return {"inside": _lefort_mask(points, geometry)}
+    if cut.kind == "genio":
+        return {"inside": _bounded_mask(points, geometry)}
+    midline = float(geometry["midline"])
+    if not np.isfinite(midline):
+        raise ValueError("The BSSO midline must be finite.")
+    result = {}
+    for side in ("left", "right"):
+        planes = geometry[side]
+        side_mask = points[0] < midline if side == "left" else points[0] >= midline
+        result[side] = (side_mask & _plane_mask(points, planes["front"])
+                       & (_plane_mask(points, planes["upper"])
+                          | _plane_mask(points, planes["sagittal"])))
+    return result
+
+
 def _cut_fragment_labels(
-    labels: np.ndarray, points: tuple[np.ndarray, ...], plan: CutPlan
+    labels: np.ndarray, points: tuple[np.ndarray, ...], doc: Document
 ) -> None:
-    lefort = plan.cuts.get("lefort", {"enabled": False})
-    bsso = plan.cuts.get("bsso", {"enabled": False})
-    genio = plan.cuts.get("genio", {"enabled": False})
-    if lefort["enabled"]:
-        labels[(labels == 1) & _lefort_mask(points, lefort)] = 2
-    if bsso["enabled"]:
-        midline = float(bsso["midline"])
-        if not np.isfinite(midline):
-            raise ValueError("The BSSO midline must be finite.")
+    upper = labels == 1
+    previous = None
+    memberships = []
+    for key in doc.upper_cuts:
+        mask = upper & cut_membership(points, doc.cuts[key])["inside"]
+        if previous is not None and np.any(previous & ~mask):
+            raise ValueError("The selected Le Fort cuts cross: the lower-level cut must lie inside the higher-level cut.")
+        previous = mask
+        memberships.append((doc.fragment_labels[f"upper:{key}"], mask))
+    for label, mask in reversed(memberships):
+        labels[mask] = label
+    if "bsso" in doc.scenario.cut_ids:
+        masks = cut_membership(points, doc.cuts["bsso"])
         for side, label in (("left", 3), ("right", 4)):
-            planes = bsso[side]
-            side_mask = points[0] < midline if side == "left" else points[0] >= midline
-            proximal = (
-                side_mask & _plane_mask(points, planes["front"])
-                & (_plane_mask(points, planes["upper"]) | _plane_mask(points, planes["sagittal"]))
-            )
-            labels[(labels == 5) & proximal] = label
-    if genio["enabled"]:
-        labels[(labels == 5) & _bounded_mask(points, genio)] = 6
+            labels[(labels == 5) & masks[side]] = label
+    if "genio" in doc.scenario.cut_ids:
+        labels[(labels == 5) & cut_membership(points, doc.cuts["genio"])["inside"]] = 6
 
 
-def fragment_labels_at_points(
-    doc: Document, points: Any, plan: CutPlan | None = None
-) -> np.ndarray:
-    """Evaluate exact cut ownership at nearest voxel centres, outside as zero.
-
-    Points are Nx3 baseline planning coordinates. This shared predicate path
-    validates inactive plans' confirmation samples without allocating volumes.
-    """
+def fragment_labels_at_points(doc: Document, points: Any) -> np.ndarray:
+    """Evaluate exact ownership at nearest voxel centres, outside as zero."""
     values = np.asarray(points, dtype=float)
     if values.ndim != 2 or values.shape[1] != 3 or not np.all(np.isfinite(values)):
         raise ValueError("Fragment samples must be finite Nx3 planning coordinates.")
@@ -451,7 +472,7 @@ def fragment_labels_at_points(
     labels = np.array([0, 8, 1, 5, 7], dtype=np.uint8)[
         doc.anatomy[indices[:, 2], indices[:, 1], indices[:, 0]]
     ]
-    _cut_fragment_labels(labels, tuple(centres[:, axis] for axis in range(3)), plan or doc.plan)
+    _cut_fragment_labels(labels, tuple(centres[:, axis] for axis in range(3)), doc)
     result[inside] = labels
     return result
 
@@ -476,7 +497,7 @@ def validate_fragment_preview(
         or fragments.dtype != np.uint8
     ):
         raise ValueError("Fragment preview must be a uint8 volume matching the source geometry.")
-    for counts, length in ((fragment_counts, 9), (anatomy_counts, 5)):
+    for counts, length in ((fragment_counts, max(doc.fragment_descriptors) + 1), (anatomy_counts, 5)):
         if (
             not isinstance(counts, np.ndarray)
             or counts.shape != (length,)
@@ -488,11 +509,10 @@ def validate_fragment_preview(
             raise ValueError("Fragment preview counts are invalid. Preview fragments again.")
     if anatomy_counts[1]:
         raise ValueError("Assign all bone to anatomy or explicitly exclude it before accepting cuts.")
-    ownership = np.array(
-        [fragment_counts[0], fragment_counts[8], fragment_counts[1:3].sum(),
-         fragment_counts[3:7].sum(), fragment_counts[7]],
-        dtype=np.int64,
-    )
+    ownership = np.zeros(5, dtype=np.int64)
+    ownership[0] = fragment_counts[0]
+    for label, fragment in doc.fragment_descriptors.items():
+        ownership[fragment.anatomy] += fragment_counts[label]
     if not np.array_equal(ownership, anatomy_counts):
         raise ValueError("Fragment ownership does not match its anatomical parent; rebuild cuts.")
     frame = np.asarray(doc.frame)
@@ -512,10 +532,10 @@ def validate_fragment_preview(
         or not np.allclose(direction.T @ direction, np.eye(3), atol=1e-5)
     ):
         raise ValueError("The input has invalid physical geometry.")
-    for label in sorted(required_fragment_labels(doc.plan)):
+    for label in sorted(required_fragment_labels(doc)):
         if not fragment_counts[label]:
             raise ValueError(f"The cuts leave {doc.fragment_names[label]} empty. Adjust the cut geometry.")
-        confirmation = doc.plan.confirmations.get(str(label))
+        confirmation = doc.review.confirmations.get(doc.fragment_descriptors[label].id)
         if confirmation is None:
             raise ValueError(f"Place a confirmation point inside {doc.fragment_names[label]} before accepting cuts.")
         point = _vector(confirmation, "Fragment confirmation")
@@ -534,7 +554,7 @@ def build_fragments(doc: Document, validate: bool = True, progress: Progress = N
         raise ValueError("Assign all bone to anatomy or explicitly exclude it before accepting cuts.")
     _check_memory(doc, doc.source.size, bytes_per_voxel=3)
     fragments = np.array([0, 8, 1, 5, 7], dtype=np.uint8)[doc.anatomy]
-    if any(cut["enabled"] for cut in doc.plan.cuts.values()):
+    if doc.scenario.cut_ids:
         affine = doc.frame @ doc.geometry.affine
         for start in range(0, doc.source.size, CUT_SLAB_VOXELS):
             stop = min(start + CUT_SLAB_VOXELS, doc.source.size)
@@ -552,13 +572,13 @@ def build_fragments(doc: Document, validate: bool = True, progress: Progress = N
                     for axis in range(3)
                 )
                 occupied = fragments.flat[indices]
-                _cut_fragment_labels(occupied, points, doc.plan)
+                _cut_fragment_labels(occupied, points, doc)
                 fragments.flat[indices] = occupied
             _report(progress, stop / doc.source.size * 0.9, "Partitioning bone fragments")
-    assert_partition(doc.source, fragments)
+    assert_partition(doc.source, fragments, maximum_label=max(doc.fragment_descriptors))
     if validate:
         assert counts is not None
-        validate_fragment_preview(doc, fragments, label_counts(fragments, 8), counts)
+        validate_fragment_preview(doc, fragments, label_counts(fragments, max(doc.fragment_descriptors)), counts)
     _report(progress, 1.0, "Fragment preview ready")
     return fragments
 
@@ -588,14 +608,14 @@ def fragment_transforms(doc: Document) -> dict[int, np.ndarray]:
     linked = motion_matrix(doc.motions["linked"])
     mandible = linked @ motion_matrix(doc.motions["mandible"])
     planning = {5: mandible}
-    # A scenario may retain motion parameters while its associated plan omits
-    # that operation. Hidden motions must neither transform nor invalidate it.
-    if doc.plan.cuts.get("lefort", {}).get("enabled", False):
-        planning[2] = linked @ motion_matrix(doc.motions["maxilla"])
-    if doc.plan.cuts.get("genio", {}).get("enabled", False):
+    inherited = linked
+    for key in reversed(doc.upper_cuts):
+        inherited = inherited @ motion_matrix(doc.motions[key])
+        planning[doc.fragment_labels[f"upper:{key}"]] = inherited
+    if "genio" in doc.scenario.cut_ids:
         planning[6] = mandible @ motion_matrix(doc.motions["chin"])
     inverse = np.linalg.inv(doc.frame)
-    result = {label: np.eye(4) for label in range(1, 9)}
+    result = {label: np.eye(4) for label in doc.fragment_descriptors}
     for label, transform in planning.items():
         result[label] = inverse @ transform @ doc.frame
     return result

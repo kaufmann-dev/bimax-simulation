@@ -202,7 +202,7 @@ def test_export_scenario_images_uses_standard_cameras_and_restores_scene(qapp, t
     monkeypatch.setattr(views, "vtkRenderLargeImage", FakeRenderLargeImage)
     doc = document()
     doc.fragments = doc.anatomy.copy()
-    doc.plan.accepted = True
+    doc.accept_review()
     doc.fragments_key = doc.configuration_key
     widget = FourViews()
     widget.resize(900, 700)
@@ -264,7 +264,7 @@ def test_export_scenario_images_renders_native_vtk_scene(qapp, tmp_path, monkeyp
     monkeypatch.setattr(views, "EXPORT_IMAGE_SIZE", 2048)
     doc = document()
     doc.fragments = doc.anatomy.copy()
-    doc.plan.accepted = True
+    doc.accept_review()
     doc.fragments_key = doc.configuration_key
     widget = FourViews()
     widget.resize(*size)

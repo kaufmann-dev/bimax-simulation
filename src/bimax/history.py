@@ -56,10 +56,11 @@ class History:
         )
         if anatomy_changed:
             doc.anatomy_revision += 1
-            for plan in doc.plans.values():
-                plan.accepted = False
-                plan.confirmations = {}
-        if anatomy_changed or doc.fragments_key != doc.configuration_key or not doc.plan.accepted:
+            doc.reviews.clear()
+            for cut in doc.cuts.values():
+                cut.accepted = False
+                cut.confirmations = {}
+        if anatomy_changed or doc.fragments_key != doc.configuration_key or not doc.cuts_accepted:
             doc.fragments = None
             doc.fragments_key = None
         doc.revision += 1
