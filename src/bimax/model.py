@@ -110,11 +110,33 @@ class Artifact:
     path: str
 
 
+PROXIMAL_IDS = ("left-proximal", "right-proximal")
+
+
+@dataclass
+class ProximalRotation:
+    angles: list[float] = field(default_factory=lambda: [0.0, 0.0, 0.0])
+    pivot: list[float] = field(default_factory=lambda: [0.0, 0.0, 0.0])
+    pivot_set: bool = False
+
+
+def new_proximal_rotations() -> dict[str, ProximalRotation]:
+    return {key: ProximalRotation() for key in PROXIMAL_IDS}
+
+
+@dataclass
+class Measurement:
+    kind: str
+    landmarks: dict[str, str]
+
+
 @dataclass
 class Scenario:
     cut_ids: list[str] = field(default_factory=list)
     motions: dict[str, Motion] = field(default_factory=new_motions)
     landmarks: list[dict[str, Any]] = field(default_factory=list)
+    proximal_rotations: dict[str, ProximalRotation] = field(default_factory=new_proximal_rotations)
+    measurements: dict[str, Measurement] = field(default_factory=dict)
 
 
 def new_scenario(cut_ids: list[str] | None = None) -> Scenario:
@@ -132,6 +154,7 @@ class Document:
     fragments_key: str | None = None
     frame: np.ndarray = field(default_factory=lambda: np.diag([-1.0, -1.0, 1.0, 1.0]))
     view_angles: list[float] = field(default_factory=lambda: [0.0, 0.0, 0.0])
+    symmetry_right: float | None = None
     cuts: dict[str, Cut] = field(default_factory=dict)
     scenarios: dict[str, Scenario] = field(default_factory=lambda: {"Scenario 1": new_scenario()})
     active_scenario: str = "Scenario 1"
@@ -215,7 +238,7 @@ class Document:
     def fragment_descriptors(self) -> dict[int, Fragment]:
         result = {
             1: Fragment("skull", 1, "Fixed skull", 2),
-            3: Fragment("left-proximal", 3, "Left proximal", 3, cut_id="bsso"),
+            3: Fragment("left-proximal", 3, "Left proximal", 3, "left-proximal", "bsso"),
             4: Fragment("right-proximal", 4, "Right proximal", 3, cut_id="bsso"),
             5: Fragment("mandible", 5, "Distal mandible", 3, "mandible"),
             6: Fragment("chin", 6, "Chin", 3, "chin", "genio"),

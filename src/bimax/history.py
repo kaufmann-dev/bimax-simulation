@@ -40,6 +40,7 @@ class History:
         destination = self.undo_stack if forward else self.redo_stack
         if not source:
             return False
+        old_key = doc.configuration_key
         edit = source.pop()
         for field, indices, before, after in edit.patches:
             getattr(doc, field).reshape(-1)[indices] = after if forward else before
@@ -60,7 +61,7 @@ class History:
             for cut in doc.cuts.values():
                 cut.accepted = False
                 cut.confirmations = {}
-        if anatomy_changed or doc.fragments_key != doc.configuration_key or not doc.cuts_accepted:
+        if anatomy_changed or old_key != doc.configuration_key:
             doc.fragments = None
             doc.fragments_key = None
         doc.revision += 1

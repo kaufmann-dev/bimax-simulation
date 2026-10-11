@@ -392,7 +392,8 @@ def test_native_import_separate_cut_move_save_reopen_export(window, qapp, tmp_pa
     window.load_path(source)
     wait_until(qapp, lambda: not window.jobs.busy)
     assert window._test_errors == []
-    assert window.tabs.currentIndex() == 1
+    assert window.tabs.currentIndex() == 0
+    window.tabs.setCurrentIndex(1)
     assert set(window.views.actors) == {1}
     np.testing.assert_array_equal(window.doc.source, source_doc.source)
     assert not window.doc.source.flags.writeable
@@ -473,7 +474,8 @@ def test_native_import_separate_cut_move_save_reopen_export(window, qapp, tmp_pa
     wait_until(qapp, lambda: not window.jobs.busy)
     assert window.doc.scenarios == expected
     assert not window.doc.source.flags.writeable
-    assert window.tabs.currentIndex() == 3
+    assert window.tabs.currentIndex() == 0
+    window.tabs.setCurrentIndex(3)
     assert window.doc.fragments is not None
     assert window.motion_spins[3].value() == 8
     assert load_project(project).scenarios == expected

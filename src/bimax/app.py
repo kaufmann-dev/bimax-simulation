@@ -22,6 +22,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QInputDialog,
     QLabel,
+    QLineEdit,
     QMainWindow,
     QMessageBox,
     QPushButton,
@@ -35,7 +36,7 @@ from PySide6.QtWidgets import (
 
 from .history import Edit, History
 from .jobs import Jobs
-from .model import ANATOMY, CUT_TYPES, Document, new_scenario
+from .model import ANATOMY, CUT_TYPES, PROXIMAL_IDS, Document, new_scenario
 
 SCENE_CACHE_BYTES = 768 * 1024**2
 
@@ -112,8 +113,10 @@ class MainWindow(QMainWindow):
 
         self.setWindowTitle("BIMAX")
         self.resize(1480, 960)
+        self.ai_control = None
         self.doc: Document | None = None
         self.project_path = None
+        self.project_version = None
         self.dirty = False
         self.history = History()
         self.jobs = Jobs(self)
@@ -176,6 +179,8 @@ class MainWindow(QMainWindow):
         split.setSizes([375, 1100])
         self.setCentralWidget(split)
         self._toolbar()
+        from .control import Control
+        self.ai_control = Control(self)
         self._status("Open a binary bone volume to begin.")
         self._sync_enabled()
 
@@ -225,6 +230,12 @@ class MainWindow(QMainWindow):
         self.cancel_button.clicked.connect(self.jobs.cancel)
         toolbar.addWidget(self.cancel_button)
         self.cancel_button.hide()
+        self.ai_banner = QLabel()
+        toolbar.addWidget(self.ai_banner)
+        self.take_control_button = QPushButton("Take control")
+        self.take_control_button.clicked.connect(lambda: self.ai_control and self.ai_control.release())
+        toolbar.addWidget(self.take_control_button)
+        self.take_control_button.hide()
 
     def _expand_3d(self, expanded):
         self.views.set_3d_expanded(expanded)
@@ -338,7 +349,7 @@ class MainWindow(QMainWindow):
         layout = self._tab("Cut")
         note("Define bone fragments", layout).setStyleSheet("font-size: 18px;")
         note(
-            "Adjust geometric cuts in the unmoved anatomy. BSSO uses a stepped split; its two proximal pieces remain fixed.",
+            "Adjust geometric cuts in the unmoved anatomy. BSSO uses a stepped split; each proximal segment can rotate independently about a picked condyle pivot.",
             layout,
         )
         self.cut_checks = {}
@@ -421,12 +432,15 @@ class MainWindow(QMainWindow):
             spin.editingFinished.connect(self._finish_motion_edit)
             self.motion_spins.append(spin)
             form.addRow(label, spin)
+        self.motion_form = form
         layout.addLayout(form)
         self._motion_before = None
         note(
             "Positive pitch is counterclockwise in the right-profile view (anterior to screen-right). Place a pivot before rotating.",
             layout,
         )
+        self.proximal_note = note("For BSSO proximal segments, pick a condyle pivot: it is a geometric approximation of the joint center. Only the selected segment rotates; its baseline pivot stays fixed.", layout)
+        self.proximal_note.hide()
         self.pivot_label = note("No pivot selected.", layout)
         button("Place pivot at next pick", lambda: self._arm_pick("pivot"), layout)
         self.reset_pivot_button = button("Reset pivot", self._reset_pivot, layout)
@@ -434,19 +448,213 @@ class MainWindow(QMainWindow):
             "Clear the selected control's pivot and rotation; keep its translation. "
             "Also cancel a pending pivot pick."
         )
-        button("Use this pivot for all jaw controls", self._share_pivot, layout)
+        self.share_pivot_button = button("Use this pivot for all jaw controls", self._share_pivot, layout)
         button("Reset selected movement", self._reset_motion, layout)
         button("Duplicate scenario…", self._duplicate_scenario, layout)
         self.baseline_check = QCheckBox("Show baseline overlay")
         self.baseline_check.toggled.connect(self.views.show_baseline)
         layout.addWidget(self.baseline_check)
         button("Right-profile view", self.views.profile_view, layout)
-        button("Add measurement landmark at next pick", lambda: self._arm_pick("landmark"), layout)
+        button("Add measurement landmark at next pick", self._arm_new_landmark, layout)
         self.landmark_label = note("Landmarks show displacement from the baseline.", layout)
+        self._build_measurements(layout)
         button("Save project…", self.save_project, layout)
         self.image_export_button = button("Export scenario images…", self._export_images, layout)
         self.export_button = button("Export fragment labelmaps…", self._export, layout)
         layout.addStretch()
+
+    def _build_measurements(self, layout):
+        box = QGroupBox("Symmetry measurements")
+        form = form_layout(box)
+        self.symmetry_reference_label = QLabel("Reference midline is unset.")
+        self.symmetry_reference_label.setWordWrap(True)
+        form.addRow(self.symmetry_reference_label)
+        self.symmetry_right_spin = QDoubleSpinBox()
+        self.symmetry_right_spin.setRange(-10000, 10000)
+        self.symmetry_right_spin.setDecimals(2)
+        form.addRow("Reference Right (mm)", self.symmetry_right_spin)
+        set_reference = QPushButton("Set reference offset")
+        set_reference.clicked.connect(lambda: self._planning_action("set_symmetry_reference", right=self.symmetry_right_spin.value()))
+        form.addRow(set_reference)
+        pick_reference = QPushButton("Set reference at next pick")
+        pick_reference.clicked.connect(lambda: self._arm_pick("symmetry_reference"))
+        form.addRow(pick_reference)
+        self.landmark_combo = QComboBox()
+        self.landmark_combo.currentTextChanged.connect(self._landmark_selected)
+        form.addRow("Landmark", self.landmark_combo)
+        self.landmark_name = QLineEdit()
+        form.addRow("Landmark name", self.landmark_name)
+        self.landmark_fragment_combo = QComboBox()
+        form.addRow("Attached fragment", self.landmark_fragment_combo)
+        self.landmark_point_spins = vector_inputs(form, "Baseline R/A/S (mm)", lambda: None)
+        for label, callback in (
+            ("New landmark", self._new_landmark),
+            ("Save landmark", self._save_landmark),
+            ("Place named landmark at next pick", lambda: self._arm_pick("landmark")),
+            ("Delete landmark", self._delete_landmark),
+        ):
+            widget = QPushButton(label)
+            widget.clicked.connect(callback)
+            form.addRow(widget)
+        self.measurement_combo = QComboBox()
+        self.measurement_combo.currentTextChanged.connect(self._measurement_selected)
+        form.addRow("Measurement", self.measurement_combo)
+        self.measurement_name = QLineEdit()
+        form.addRow("Measurement name", self.measurement_name)
+        self.measurement_kind_combo = QComboBox()
+        for label, kind in (("Midline deviation", "midline"), ("Paired symmetry", "paired"), ("Ramus inclination", "ramus")):
+            self.measurement_kind_combo.addItem(label, kind)
+        self.measurement_kind_combo.currentIndexChanged.connect(self._measurement_kind_changed)
+        form.addRow("Measure", self.measurement_kind_combo)
+        self.measurement_role_labels: list[QLabel] = []
+        self.measurement_role_combos: list[QComboBox] = []
+        for _ in range(4):
+            role_label, combo = QLabel(), QComboBox()
+            form.addRow(role_label, combo)
+            self.measurement_role_labels.append(role_label)
+            self.measurement_role_combos.append(combo)
+        for label, callback in (
+            ("New measurement", lambda: self.measurement_name.clear()),
+            ("Save measurement", self._save_measurement),
+            ("Delete measurement", self._delete_measurement),
+        ):
+            widget = QPushButton(label)
+            widget.clicked.connect(callback)
+            form.addRow(widget)
+        self.measurement_results_label = QLabel()
+        self.measurement_results_label.setWordWrap(True)
+        self.measurement_results_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        form.addRow(self.measurement_results_label)
+        explanation = QLabel("Planning R/A/S measurements are independent of the camera. Midline: positive Right. Paired differences: left minus right; height = Superior, front = Anterior, lateral = distance from reference (mm). Ramus: condyle minus angle, frontal positive outward and sagittal positive anterior (degrees); differences left minus right.")
+        explanation.setWordWrap(True)
+        form.addRow(explanation)
+        layout.addWidget(box)
+        self._measurement_kind_changed()
+
+    def _planning_action(self, operation, **arguments):
+        if self.doc is None or self.jobs.busy or (self.ai_control and self.ai_control.session):
+            return
+        try:
+            self._command(operation, **arguments)
+            if operation == "set_landmark" and not arguments.get("remove"):
+                self.landmark_combo.setCurrentText(arguments["name"])
+            if operation == "set_measurement" and not arguments.get("remove"):
+                self.measurement_combo.setCurrentText(arguments["name"])
+        except ValueError as error:
+            self._error(str(error))
+
+    def _arm_new_landmark(self):
+        self._new_landmark()
+        self._arm_pick("landmark")
+
+    def _new_landmark(self):
+        self.landmark_name.clear()
+        for spin in self.landmark_point_spins:
+            spin.setValue(0)
+
+    def _save_landmark(self):
+        if self.doc:
+            self._planning_action("set_landmark", scenario=self.doc.active_scenario,
+                                  name=self.landmark_name.text().strip(),
+                                  fragment=self.landmark_fragment_combo.currentData(),
+                                  point=[spin.value() for spin in self.landmark_point_spins])
+
+    def _delete_landmark(self):
+        if self.doc:
+            self._planning_action("set_landmark", scenario=self.doc.active_scenario,
+                                  name=self.landmark_name.text().strip(), remove=True)
+
+    def _landmark_selected(self, name=None):
+        if self.loading or self.doc is None:
+            return
+        name = self.landmark_combo.currentText() if name is None else name
+        item = next((item for item in self.doc.scenario.landmarks if item["name"] == name), None)
+        if item:
+            self.landmark_name.setText(item["name"])
+            self.landmark_fragment_combo.setCurrentIndex(self.landmark_fragment_combo.findData(item["fragment"]))
+            for spin, value in zip(self.landmark_point_spins, item["point"], strict=True):
+                spin.setValue(value)
+
+    def _measurement_kind_changed(self):
+        from .symmetry import ROLES
+        roles = ROLES[self.measurement_kind_combo.currentData()]
+        for index, (label, combo) in enumerate(zip(self.measurement_role_labels, self.measurement_role_combos, strict=True)):
+            label.setVisible(index < len(roles))
+            combo.setVisible(index < len(roles))
+            if index < len(roles):
+                label.setText(roles[index].replace("_", " ").title())
+
+    def _measurement_selected(self, name=None):
+        if self.loading or self.doc is None:
+            return
+        name = self.measurement_combo.currentText() if name is None else name
+        definition = self.doc.scenario.measurements.get(name)
+        if definition:
+            from .symmetry import ROLES
+            self.measurement_name.setText(name)
+            self.measurement_kind_combo.setCurrentIndex(self.measurement_kind_combo.findData(definition.kind))
+            for index, role in enumerate(ROLES[definition.kind]):
+                self.measurement_role_combos[index].setCurrentText(definition.landmarks[role])
+
+    def _save_measurement(self):
+        if self.doc:
+            from .symmetry import ROLES
+            kind = self.measurement_kind_combo.currentData()
+            self._planning_action("set_measurement", scenario=self.doc.active_scenario,
+                                  name=self.measurement_name.text().strip(), kind=kind,
+                                  landmarks={role: self.measurement_role_combos[index].currentText() for index, role in enumerate(ROLES[kind])})
+
+    def _delete_measurement(self):
+        if self.doc:
+            self._planning_action("set_measurement", scenario=self.doc.active_scenario,
+                                  name=self.measurement_name.text().strip(), remove=True)
+
+    def _load_measurement_controls(self):
+        if self.doc is None:
+            return
+        from .symmetry import active_fragment_ids
+        previous, self.loading = self.loading, True
+        for combo, names in ((self.landmark_combo, [item["name"] for item in self.doc.scenario.landmarks]),
+                             (self.measurement_combo, list(self.doc.scenario.measurements))):
+            selected = combo.currentText()
+            combo.clear()
+            combo.addItems(names)
+            combo.setCurrentIndex(max(0, combo.findText(selected)))
+        selected = self.landmark_fragment_combo.currentData()
+        self.landmark_fragment_combo.clear()
+        for fragment in self.doc.fragment_descriptors.values():
+            if fragment.id in active_fragment_ids(self.doc) - {"excluded", "unassigned"}:
+                self.landmark_fragment_combo.addItem(fragment.name, fragment.id)
+        self.landmark_fragment_combo.setCurrentIndex(max(0, self.landmark_fragment_combo.findData(selected)))
+        names = [item["name"] for item in self.doc.scenario.landmarks]
+        for combo in self.measurement_role_combos:
+            selected = combo.currentText()
+            combo.clear()
+            combo.addItems(names)
+            combo.setCurrentIndex(max(0, combo.findText(selected)))
+        if self.doc.symmetry_right is not None:
+            self.symmetry_right_spin.setValue(self.doc.symmetry_right)
+        self.loading = previous
+        self._landmark_selected()
+        self._measurement_selected()
+        self._show_measurement_results()
+
+    def _show_measurement_results(self):
+        if self.doc is None:
+            return
+        from .symmetry import measurement_results
+        self.symmetry_reference_label.setText(f"Reference plane: R = {self.doc.symmetry_right:.2f} mm" if self.doc.symmetry_right is not None else "Reference midline is unset; select a point or set an offset.")
+        lines = []
+        for name, result in measurement_results(self.doc).items():
+            lines.append(name)
+            if result["status"] == "invalid":
+                lines.append(result["error"])
+            else:
+                for field, baseline in result["baseline"].items():
+                    unit = "°" if field.endswith("_deg") else "mm"
+                    title = field.removesuffix("_deg").removesuffix("_mm").replace("_", " ")
+                    lines.append(f"{title}: baseline {baseline:+.2f}, moved {result['moved'][field]:+.2f} {unit}")
+        self.measurement_results_label.setText("\n".join(lines) or "Create a named measurement to compare baseline and moved results.")
 
     def _status(self, message):
         self.statusBar().showMessage(message)
@@ -454,6 +662,8 @@ class MainWindow(QMainWindow):
     def _error(self, message):
         self._after_save = None
         self._status(message)
+        if self.ai_control and self.ai_control.session:
+            return
         QMessageBox.warning(self, "BIMAX", message)
 
     def _busy_changed(self, busy):
@@ -490,12 +700,15 @@ class MainWindow(QMainWindow):
     def _sync_enabled(self):
         has_doc = self.doc is not None
         busy = self.jobs.busy
+        locked = bool(self.ai_control and self.ai_control.session)
+        self.tabs.setEnabled(not busy and not locked)
+        self.scenario_combo.setEnabled(has_doc and not busy and not locked)
         for spin in self.orientation_spins:
             spin.setEnabled(has_doc and not busy)
         for name, action in (
             self.toolbar_actions.items() if hasattr(self, "toolbar_actions") else []
         ):
-            action.setEnabled(not busy and (has_doc or name in ("Import volume", "Open project")))
+            action.setEnabled((not busy and not locked and (has_doc or name in ("Import volume", "Open project"))) or name == "Right profile")
         for index in range(1, 4):
             self.tabs.setTabEnabled(index, has_doc)
         if hasattr(self, "accept_separation_button"):
@@ -515,7 +728,7 @@ class MainWindow(QMainWindow):
                     motion_model.item(self.motion_combo.findData("chin")).setEnabled(chin_enabled)
                 if not chin_enabled and self.motion_combo.currentData() == "chin":
                     self.motion_combo.setCurrentIndex(0)
-            motion = self.doc.motions[self.motion_combo.currentData()] if self.doc else None
+            motion = self._selected_motion() if self.doc else None
             self.reset_pivot_button.setEnabled(
                 not busy
                 and motion is not None
@@ -530,13 +743,45 @@ class MainWindow(QMainWindow):
                 spin.setEnabled(
                     can_move
                     and (
-                        i < 3
+                        (i < 3 and self.motion_combo.currentData() not in PROXIMAL_IDS)
                         or (
+                            i >= 3 and
                             self.doc is not None
-                            and self.doc.motions[self.motion_combo.currentData()].pivot_set
+                            and self._selected_motion().pivot_set
                         )
                     )
                 )
+
+    def _command(self, operation, scenario=None, **args):
+        from .commands import Commands
+        if self.doc is None:
+            return {}
+        self._finish_motion_edit()
+        self._cache_active_scene()
+        result = Commands(self.doc, self.history).execute(operation, scenario, **args)
+        if result["changed"]:
+            self.dirty = True
+            self.setWindowTitle(f"BIMAX — {self.doc.source_name} *")
+        self._refresh_command(operation)
+        return result
+
+    def _refresh_command(self, operation):
+        if self.doc is None:
+            return
+        if self.doc.fragments is None:
+            self._loaded_meshes.pop(True, None)
+            self.pending_fragments = None
+            self._pending_key = None
+            self._fragment_meshes = self._fragment_counts = None
+            self.views.invalidate_surfaces(True)
+        self._load_document_controls()
+        if operation == "set_orientation":
+            self.views.profile_view()
+        if self.ai_control and self.ai_control.session:
+            self.ai_control.show_scene()
+        else:
+            self._activate_scene()
+        self._sync_enabled()
 
     def _mark_dirty(self):
         if self.doc:
@@ -639,6 +884,9 @@ class MainWindow(QMainWindow):
             self.motion_combo.addItem(self.doc.fragment_names[label], key)
         self.motion_combo.addItem("Distal mandible", "mandible")
         self.motion_combo.addItem("Chin", "chin")
+        if "bsso" in self.doc.scenario.cut_ids:
+            self.motion_combo.addItem("Left proximal segment", "left-proximal")
+            self.motion_combo.addItem("Right proximal segment", "right-proximal")
         self.motion_combo.setCurrentIndex(max(0, self.motion_combo.findData(old)))
         old = self.confirm_combo.currentData()
         self.confirm_combo.clear()
@@ -651,25 +899,21 @@ class MainWindow(QMainWindow):
         self.loading = previous
 
     def _select_cut(self, cut_id, enabled):
+        if self.ai_control and self.ai_control.session:
+            return
         if self.loading or self.doc is None or self.jobs.busy:
             return
-        self._finish_motion_edit()
-        self._cache_active_scene()
-        before = deepcopy(self.doc.scenarios)
-        selected = self.doc.scenario.cut_ids
+        selected = list(self.doc.scenario.cut_ids)
         if enabled and cut_id not in selected:
             cut = self.doc.cuts[cut_id]
             if cut.kind == "lefort":
-                selected[:] = [key for key in selected if not (
-                    self.doc.cuts[key].kind == "lefort" and self.doc.cuts[key].level == cut.level)]
+                selected = [key for key in selected if not (self.doc.cuts[key].kind == "lefort" and self.doc.cuts[key].level == cut.level)]
             selected.append(cut_id)
         elif not enabled and cut_id in selected:
             selected.remove(cut_id)
         else:
             return
-        self.doc.scenario.landmarks = []
-        self._remember("Select shared cuts", {"scenarios": before}, {"scenarios": deepcopy(self.doc.scenarios)})
-        self._activate_scene()
+        self._command("select_cuts", self.doc.active_scenario, cut_ids=selected)
 
     def _remember(self, name, before, after, patches=None):
         self.history.push(Edit(name, patches or [], before, after))
@@ -688,6 +932,8 @@ class MainWindow(QMainWindow):
         return result == QMessageBox.StandardButton.Discard
 
     def import_volume(self):
+        if self.ai_control and self.ai_control.session:
+            return
         if self.jobs.busy or not self._confirm_replace():
             return
         path, _ = QFileDialog.getOpenFileName(
@@ -697,6 +943,8 @@ class MainWindow(QMainWindow):
             self.load_path(path)
 
     def open_project(self):
+        if self.ai_control and self.ai_control.session:
+            return
         if self.jobs.busy or not self._confirm_replace():
             return
         path, _ = QFileDialog.getOpenFileName(self, "Open project", "", "BIMAX project (*.bimax)")
@@ -704,11 +952,14 @@ class MainWindow(QMainWindow):
             self.load_path(path)
 
     def load_path(self, path):
+        path = Path(path).absolute()
         operation = "open" if str(path).endswith(".bimax") else "import"
         self.jobs.submit(operation, path=str(path))
         self._status("Loading volume and extracting display surfaces…")
 
     def save_project(self, save_as=False):
+        if self.ai_control and self.ai_control.session:
+            return
         if self.doc is None or self.jobs.busy:
             return
         path = self.project_path
@@ -721,7 +972,9 @@ class MainWindow(QMainWindow):
             return
         if not path.endswith(".bimax"):
             path += ".bimax"
-        self.jobs.submit("save", self.doc, path=path)
+        from .storage import file_version
+        version = self.project_version if path == self.project_path else file_version(path)
+        self.jobs.submit("save", self.doc, path=path, expected_version=version)
         self._status("Saving portable project…")
 
     def _export(self):
@@ -771,6 +1024,16 @@ class MainWindow(QMainWindow):
             self._status(f"Exported {len(exported)} scenario images to {exported[0].parent}.")
 
     def _job_finished(self, operation, revision, result):
+        if "_control_session" in result:
+            control = self.ai_control
+            if not control or result["_control_session"] != control.session or result["_control_job"] != control.active_job:
+                self._status("Discarded a result from a revoked editing session.")
+                return
+            if not control.owns_result(operation, revision, result):
+                self._status("Discarded an outdated AI computation result.")
+                return
+            if operation in ("cuts_preview", "load_prepared"):
+                return  # Control publishes provisional geometry without accepting it.
         if operation not in ("import", "open") and self.doc is None:
             return
         if operation not in ("import", "open") and self.doc and operation != "load_prepared" and revision != self.doc.revision:
@@ -798,6 +1061,7 @@ class MainWindow(QMainWindow):
             assert self.doc is not None
             self.doc.source.setflags(write=False)
             self.project_path = result.get("path") if operation == "open" else None
+            self.project_version = result.get("file_version")
             self._loaded_meshes = result["surface_sets"]
             self._scene_cache.clear()
             self._cache_active_scene()
@@ -864,6 +1128,7 @@ class MainWindow(QMainWindow):
         elif operation == "save":
             assert self.doc is not None
             self.project_path = result["path"]
+            self.project_version = result.get("file_version")
             self.dirty = False
             self.setWindowTitle(f"BIMAX — {self.doc.source_name}")
             self._status(f"Project saved: {self.project_path}")
@@ -904,6 +1169,7 @@ class MainWindow(QMainWindow):
         self._load_cut_controls()
         self._load_motion()
         self._assignment_counts()
+        self._load_measurement_controls()
         self._update_transforms()
 
     def _assignment_counts(self):
@@ -918,6 +1184,8 @@ class MainWindow(QMainWindow):
         )
 
     def _tool_changed(self):
+        if self.ai_control and self.ai_control.session:
+            return
         tool = self.tool_combo.currentData()
         self.pick_mode = "component" if tool == "component" else None
         visual_tool = {"component": "pick", "unbarrier": "barrier", "unseed": "seed"}.get(
@@ -927,6 +1195,8 @@ class MainWindow(QMainWindow):
         self.views.set_label(self.label_combo.currentData())
 
     def _paint(self, payload):
+        if self.ai_control and self.ai_control.session:
+            return
         if self.doc is None or self.jobs.busy or self.tabs.currentIndex() != 1:
             return
         indices = np.unique(payload["indices"])
@@ -1125,6 +1395,7 @@ class MainWindow(QMainWindow):
         self.loading = True
         config = self._cut_config()
         bsso = self.operation_combo.currentData() == "bsso"
+        selected_plane = self.plane_combo.currentData()
         self.plane_combo.clear()
         if bsso:
             for side in ("left", "right"):
@@ -1135,6 +1406,7 @@ class MainWindow(QMainWindow):
                 self.plane_combo.addItem(key.replace("_", " ").title(), key)
         else:
             self.plane_combo.addItem("Cut plane", "plane")
+        self.plane_combo.setCurrentIndex(max(0, self.plane_combo.findData(selected_plane)))
         for i in range(3):
             for widgets, key in ((self.region_min, "min"), (self.region_max, "max")):
                 widgets[i].setEnabled(not bsso)
@@ -1172,6 +1444,8 @@ class MainWindow(QMainWindow):
                 "reviews": deepcopy(self.doc.reviews)}
 
     def _plane_controls_changed(self):
+        if self.ai_control and self.ai_control.session:
+            return
         if self.loading or self.doc is None:
             return
         normal = np.array([s.value() for s in self.plane_normal])
@@ -1179,34 +1453,44 @@ class MainWindow(QMainWindow):
             self._error("A cut plane needs a nonzero normal.")
             self._load_plane_controls()
             return
-        before = self._cut_edit_snapshot()
-        plane = self._selected_plane()
+        key = self.operation_combo.currentData()
+        geometry = deepcopy(self._cut_config())
+        # The selected plane path differs between the seven shared definitions.
+        if key == "bsso":
+            side, plane_id = self.plane_combo.currentData().split(".")
+            plane = geometry[side][plane_id]
+        elif key == "genio":
+            plane = geometry["plane"]
+        else:
+            plane = geometry["planes"][self.plane_combo.currentData()]
         plane["origin"] = [s.value() for s in self.plane_origin]
         plane["normal"] = (normal / np.linalg.norm(normal)).tolist()
-        if before == self._cut_edit_snapshot():
-            return
-        self._invalidate()
-        self._remember("Adjust cut plane", before, self._cut_edit_snapshot())
+        self._command("replace_cut", cut_id=key, geometry=geometry, action_label="Adjust cut plane")
         self._show_cut_plane()
 
     def _region_changed(self):
+        if self.ai_control and self.ai_control.session:
+            return
         if self.loading or self.doc is None:
             return
-        before = self._cut_edit_snapshot()
-        config = self._cut_config()
-        if self.operation_combo.currentData() == "bsso":
+        config = deepcopy(self._cut_config())
+        key = self.operation_combo.currentData()
+        if key == "bsso":
             config["midline"] = self.midline.value()
         else:
             config["region"] = {
-                "min": [s.value() for s in self.region_min],
-                "max": [s.value() for s in self.region_max],
+                "min": [spin.value() for spin in self.region_min],
+                "max": [spin.value() for spin in self.region_max],
             }
-        if before == self._cut_edit_snapshot():
-            return
-        self._invalidate()
-        self._remember("Adjust cut region", before, self._cut_edit_snapshot())
+        try:
+            self._command("replace_cut", cut_id=key, geometry=config, action_label="Adjust cut region")
+        except ValueError as error:
+            self._error(str(error))
+            self._load_cut_controls()
 
     def _plane_dragged(self, origin, normal):
+        if self.ai_control and self.ai_control.session:
+            return
         if self.doc is None or self.loading or self.tabs.currentIndex() != 2:
             return
         plan = self.doc.world_to_plan(origin)
@@ -1217,6 +1501,8 @@ class MainWindow(QMainWindow):
         self._plane_controls_changed()
 
     def _build_cuts(self, accepted):
+        if self.ai_control and self.ai_control.session:
+            return
         if self.doc is None or self.jobs.busy:
             return
         if accepted:
@@ -1227,24 +1513,26 @@ class MainWindow(QMainWindow):
                 or self._pending_key != self.doc.configuration_key
             ):
                 return
-            from .engine import validate_fragment_preview
+            from .commands import Commands
 
             try:
-                validate_fragment_preview(
-                    self.doc, self.pending_fragments, self._fragment_counts, self._anatomy_counts
+                Commands(self.doc, self.history).execute(
+                    "accept_combination", self.doc.active_scenario,
+                    fragments=self.pending_fragments, fragment_counts=self._fragment_counts,
+                    anatomy_counts=self._anatomy_counts,
                 )
             except ValueError as error:
                 self._error(str(error))
                 return
             self.doc.fragments = self.pending_fragments
             self.doc.fragments_key = self.doc.configuration_key
-            self.doc.accept_review()
             self._loaded_meshes[True] = self._fragment_meshes
             self.pending_fragments = None
             self._pending_key = None
             self._fragment_meshes = self._fragment_counts = None
             self._remesh_timer.stop()
-            self._mark_dirty()
+            self.dirty = True
+            self.setWindowTitle(f"BIMAX — {self.doc.source_name} *")
             self._cache_active_scene()
             self._load_scenario_controls()
             if self.tabs.currentIndex() == 3:
@@ -1258,6 +1546,8 @@ class MainWindow(QMainWindow):
         self._status("Partitioning bone fragments at native resolution…")
 
     def _arm_pick(self, mode):
+        if self.ai_control and self.ai_control.session:
+            return
         if self.doc is None:
             return
         self.pick_mode = mode
@@ -1292,6 +1582,8 @@ class MainWindow(QMainWindow):
         return candidates[np.argmin(distance)], actor
 
     def _point_picked(self, point):
+        if self.ai_control and self.ai_control.session:
+            return
         if self.doc is None or self.jobs.busy:
             return
         self.last_point = point
@@ -1327,25 +1619,31 @@ class MainWindow(QMainWindow):
                     f"That point is {self.doc.fragment_names.get(value, 'background')}; select a point inside {self.doc.fragment_names[expected]}."
                 )
                 return
-            self.doc.review.confirmations[self.doc.fragment_descriptors[expected].id] = self.doc.world_to_plan(
-                self.doc.geometry.index_to_world(xyz)
-            ).tolist()
-            self._mark_dirty()
+            from .commands import Commands
+            Commands(self.doc, self.history).execute(
+                "confirm_fragment", self.doc.active_scenario,
+                fragment=self.doc.fragment_descriptors[expected].id,
+                point=self.doc.world_to_plan(self.doc.geometry.index_to_world(xyz)).tolist(),
+            )
+            self.dirty = True
+            self.setWindowTitle(f"BIMAX — {self.doc.source_name} *")
             self.confirm_label.setText(
                 "Confirmed: "
                 + ", ".join(self.doc.fragment_names[self.doc.fragment_labels[i]] for i in self.doc.review.confirmations if i in self.doc.fragment_labels)
             )
+        elif mode == "symmetry_reference":
+            self._planning_action("set_symmetry_reference", point=plan)
         elif mode == "pivot":
-            before = deepcopy(self.doc.scenarios)
-            motion = self.doc.motions[self.motion_combo.currentData()]
-            motion.pivot, motion.pivot_set = plan, True
-            self._remember(
-                "Place pivot", {"scenarios": before}, {"scenarios": deepcopy(self.doc.scenarios)}
-            )
-            self._load_motion()
-            self._update_transforms()
+            target = self.motion_combo.currentData()
+            if target in PROXIMAL_IDS:
+                _, fragment = self._picked_voxel(point, self.doc.fragments)
+                if fragment != self.doc.fragment_labels[target]:
+                    self._status("Pick a condyle point on the selected proximal segment.")
+                    return
+            self._planning_action("set_proximal_rotations" if target in PROXIMAL_IDS else "set_movements", scenario=self.doc.active_scenario,
+                          targets={self.motion_combo.currentData(): {"pivot": plan}},
+                          action_label="Place pivot")
         elif mode == "landmark":
-            scenarios_before = deepcopy(self.doc.scenarios)
             if self.doc.fragments is None:
                 self._status("Accept fragments before adding measurement landmarks.")
                 return
@@ -1353,19 +1651,10 @@ class MainWindow(QMainWindow):
             if not fragment:
                 self._status("Pick a bone fragment for a measurement landmark.")
                 return
-            self.doc.scenario.landmarks.append(
-                {
-                    "name": f"Point {len(self.doc.scenario.landmarks) + 1}",
-                    "point": plan,
-                    "fragment": self.doc.fragment_descriptors[fragment].id,
-                }
-            )
-            self._remember(
-                "Add landmark",
-                {"scenarios": scenarios_before},
-                {"scenarios": deepcopy(self.doc.scenarios)},
-            )
-            self._update_transforms()
+            self._planning_action("set_landmark", scenario=self.doc.active_scenario,
+                          name=self.landmark_name.text().strip() or f"Point {len(self.doc.scenario.landmarks) + 1}",
+                          point=plan, fragment=self.doc.fragment_descriptors[fragment].id,
+                          action_label="Add landmark")
         else:
             self._status(
                 f"Planning coordinates: R {plan[0]:.2f}, A {plan[1]:.2f}, S {plan[2]:.2f} mm"
@@ -1375,15 +1664,13 @@ class MainWindow(QMainWindow):
             self.views.set_tool("navigate")
 
     def _orientation_changed(self):
+        if self.ai_control and self.ai_control.session:
+            return
         if self.loading or self.doc is None or self.jobs.busy:
             return
         angles = [spin.value() for spin in self.orientation_spins]
-        if angles == self.doc.view_angles:
-            return
-        before = list(self.doc.view_angles)
-        self.doc.view_angles = angles
-        self._remember("Orient whole skull", {"view_angles": before}, {"view_angles": angles})
-        self.views.profile_view()
+        if angles != self.doc.view_angles:
+            self._command("set_orientation", rotation=dict(zip(("pitch", "roll", "yaw"), angles, strict=True)))
 
     def _reset_orientation(self):
         if self.doc is None or self.jobs.busy:
@@ -1393,13 +1680,15 @@ class MainWindow(QMainWindow):
         self._orientation_changed()
 
     def _frame_changed(self):
+        if self.ai_control and self.ai_control.session:
+            return
         if self.loading or self.doc is None:
             return
         from scipy.spatial.transform import Rotation
 
         from .engine import default_cuts
 
-        if any(cut.accepted or cut.confirmations for cut in self.doc.cuts.values()) or any(
+        if self.doc.symmetry_right is not None or any(scenario.landmarks or scenario.measurements for scenario in self.doc.scenarios.values()) or any(cut.accepted or cut.confirmations for cut in self.doc.cuts.values()) or any(
             m.pivot_set or any(m.translation) or any(m.angles)
             for scenario in self.doc.scenarios.values()
             for m in scenario.motions.values()
@@ -1407,7 +1696,7 @@ class MainWindow(QMainWindow):
             answer = QMessageBox.question(
                 self,
                 "Change head reference",
-                "Changing the reference resets cuts, pivots, landmarks and movement scenarios. Keep the segmentation and reset these settings?",
+                "Changing the reference resets cuts, pivots, landmarks, symmetry measurements and movement scenarios. Keep the segmentation and reset these settings?",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 QMessageBox.StandardButton.No,
             )
@@ -1416,12 +1705,13 @@ class MainWindow(QMainWindow):
                 return
         before = {
             key: deepcopy(getattr(self.doc, key))
-            for key in ("frame", "cuts", "scenarios", "active_scenario", "reviews")
+            for key in ("frame", "cuts", "scenarios", "active_scenario", "reviews", "symmetry_right")
         }
         self.doc.frame = np.eye(4)
         self.doc.frame[:3, :3] = Rotation.from_euler(
             "xyz", [s.value() for s in self.frame_spins], degrees=True
         ).as_matrix() @ np.diag([-1.0, -1.0, 1.0])
+        self.doc.symmetry_right = None
         self.doc.cuts = default_cuts(self.doc)
         self.doc.scenarios = {"Scenario 1": new_scenario()}
         self.doc.active_scenario = "Scenario 1"
@@ -1431,17 +1721,24 @@ class MainWindow(QMainWindow):
         self._mark_dirty()
         self._load_document_controls()
 
+    def _selected_motion(self):
+        assert self.doc is not None
+        key = self.motion_combo.currentData()
+        return self.doc.scenario.proximal_rotations[key] if key in PROXIMAL_IDS else self.doc.motions[key]
+
     def _load_motion(self):
         if self.doc is None or self.loading:
             return
-        motion = self.doc.motions[self.motion_combo.currentData()]
+        motion = self._selected_motion()
+        proximal = self.motion_combo.currentData() in PROXIMAL_IDS
+        self.proximal_note.setVisible(proximal)
+        self.share_pivot_button.setEnabled(not proximal)
+        for spin in self.motion_spins[:3]:
+            spin.setVisible(not proximal)
+            self.motion_form.labelForField(spin).setVisible(not proximal)
         self.loading = True
-        values = [
-            motion.translation[0],
-            motion.translation[1],
-            -motion.translation[2],
-            *motion.angles,
-        ]
+        translation = [0, 0, 0] if proximal else [motion.translation[0], motion.translation[1], -motion.translation[2]]
+        values = [*translation, *motion.angles]
         for spin, value in zip(self.motion_spins, values, strict=True):
             spin.setValue(value)
         self.loading = False
@@ -1453,15 +1750,29 @@ class MainWindow(QMainWindow):
         self._sync_enabled()
 
     def _motion_changed(self):
+        if self.ai_control and self.ai_control.session:
+            return
         if self.loading or self.doc is None or self.doc.fragments is None:
             return
         if self._motion_before is None:
             self._motion_before = deepcopy(self.doc.scenarios)
-        motion = self.doc.motions[self.motion_combo.currentData()]
-        v = [s.value() for s in self.motion_spins]
-        motion.translation = [v[0], v[1], -v[2]]
-        motion.angles = v[3:]
-        self._mark_dirty()
+        from .commands import Commands
+        values = [spin.value() for spin in self.motion_spins]
+        target = self.motion_combo.currentData()
+        rotation = dict(zip(("pitch", "roll", "yaw"), values[3:], strict=True))
+        if target in PROXIMAL_IDS:
+            result = Commands(self.doc, self.history).execute(
+                "set_proximal_rotations", self.doc.active_scenario, record_history=False,
+                targets={target: {"rotation": rotation}},
+            )
+        else:
+            result = Commands(self.doc, self.history).execute(
+                "set_movements", self.doc.active_scenario, record_history=False,
+                targets={target: {"translation": [values[0], values[1], -values[2]], "rotation": rotation}},
+            )
+        if result["changed"]:
+            self.dirty = True
+            self.setWindowTitle(f"BIMAX — {self.doc.source_name} *")
         self._update_transforms()
 
     def _finish_motion_edit(self):
@@ -1487,46 +1798,44 @@ class MainWindow(QMainWindow):
         self.views.set_transforms(
             transforms if self.doc.fragments is not None and self.tabs.currentIndex() == 3 else {}
         )
-        motion = self.doc.motions[self.motion_combo.currentData()]
+        motion = self._selected_motion()
         self.views.set_pivot(self.doc.plan_to_world(motion.pivot) if motion.pivot_set else None)
         lines = []
         displayed_landmarks = []
-        for landmark in self.doc.scenario.landmarks:
-            point = self.doc.plan_to_world(landmark["point"])
-            matrix = (
-                transforms.get(self.doc.fragment_labels.get(landmark["fragment"], 0), np.eye(4))
-                if self.tabs.currentIndex() == 3 and self.doc.fragments is not None
-                else np.eye(4)
-            )
-            moved = matrix[:3, :3] @ point + matrix[:3, 3]
+        from .symmetry import landmark_results
+        for landmark in landmark_results(self.doc):
+            if landmark["status"] != "valid":
+                lines.append(f"{landmark['name']}: {landmark['error']}")
+                continue
+            point = self.doc.plan_to_world(landmark["baseline"])
+            moved = self.doc.plan_to_world(landmark["moved"]) if self.tabs.currentIndex() == 3 and self.doc.fragments is not None else point
             delta = self.doc.frame[:3, :3] @ (moved - point)
             displayed_landmarks.append({"name": landmark["name"], "point": point, "moved": moved})
-            lines.append(
-                f"{landmark['name']}: {np.linalg.norm(delta):.2f} mm (R {delta[0]:+.2f}, A {delta[1]:+.2f}, S {delta[2]:+.2f})"
-            )
+            lines.append(f"{landmark['name']}: {np.linalg.norm(delta):.2f} mm (R {delta[0]:+.2f}, A {delta[1]:+.2f}, S {delta[2]:+.2f})")
         self.landmark_label.setText(
             "\n".join(lines) or "Pick landmarks to measure displacement from baseline."
         )
         self.views.set_landmarks(displayed_landmarks)
+        self._show_measurement_results()
 
     def _share_pivot(self):
+        if self.ai_control and self.ai_control.session:
+            return
         if self.doc is None:
+            return
+        if self.motion_combo.currentData() in PROXIMAL_IDS:
             return
         pivot = self.doc.motions[self.motion_combo.currentData()]
         if not pivot.pivot_set:
             self._status("Place a pivot first.")
             return
-        before = deepcopy(self.doc.scenarios)
-        for motion in self.doc.motions.values():
-            motion.pivot = list(pivot.pivot)
-            motion.pivot_set = True
-        self._remember(
-            "Share pivot", {"scenarios": before}, {"scenarios": deepcopy(self.doc.scenarios)}
-        )
-        self._update_transforms()
-        self._load_motion()
+        self._command("set_movements", self.doc.active_scenario,
+                      targets={key: {"pivot": list(pivot.pivot)} for key in self.doc.motions},
+                      action_label="Share pivot")
 
     def _reset_pivot(self):
+        if self.ai_control and self.ai_control.session:
+            return
         if self.doc is None or self.jobs.busy:
             return
         self._finish_motion_edit()
@@ -1534,32 +1843,35 @@ class MainWindow(QMainWindow):
             self.pick_mode = None
             self.views.set_tool("navigate")
             self._status("Pivot pick cancelled.")
-        motion = self.doc.motions[self.motion_combo.currentData()]
+        motion = self._selected_motion()
         if not (motion.pivot_set or any(motion.pivot) or any(motion.angles)):
             self._sync_enabled()
             return
-        before = deepcopy(self.doc.scenarios)
-        motion.pivot, motion.angles, motion.pivot_set = [0.0] * 3, [0.0] * 3, False
-        self._remember(
-            "Reset pivot", {"scenarios": before}, {"scenarios": deepcopy(self.doc.scenarios)}
-        )
-        self._load_motion()
-        self._update_transforms()
+        if self.motion_combo.currentData() in PROXIMAL_IDS:
+            self._command("reset_proximal_rotations", self.doc.active_scenario,
+                          targets=[self.motion_combo.currentData()], clear_pivots=True, action_label="Reset proximal pivot")
+        else:
+            self._command("reset_pivot", self.doc.active_scenario,
+                          target=self.motion_combo.currentData(), action_label="Reset pivot")
         self._status("Pivot and rotation reset; translation retained.")
 
     def _reset_motion(self):
+        if self.ai_control and self.ai_control.session:
+            return
         if self.doc is None:
             return
-        before = deepcopy(self.doc.scenarios)
-        motion = self.doc.motions[self.motion_combo.currentData()]
-        motion.translation, motion.angles = [0.0] * 3, [0.0] * 3
-        self._remember(
-            "Reset movement", {"scenarios": before}, {"scenarios": deepcopy(self.doc.scenarios)}
-        )
-        self._load_motion()
-        self._update_transforms()
+        if self.motion_combo.currentData() in PROXIMAL_IDS:
+            self._command("reset_proximal_rotations", self.doc.active_scenario,
+                          targets=[self.motion_combo.currentData()], action_label="Reset proximal rotation")
+        else:
+            self._command("set_movements", self.doc.active_scenario,
+                          targets={self.motion_combo.currentData(): {
+                              "translation": [0.0] * 3, "rotation": {"pitch": 0, "roll": 0, "yaw": 0},
+                          }}, action_label="Reset movement")
 
     def _scenario_changed(self, name):
+        if self.ai_control and self.ai_control.session:
+            return
         if (
             self.loading
             or self.doc is None
@@ -1568,12 +1880,11 @@ class MainWindow(QMainWindow):
             or name == self.doc.active_scenario
         ):
             return
-        self._finish_motion_edit()
-        self.doc.active_scenario = name
-        self._mark_dirty()
-        self._activate_scene()
+        self._command("select_scenario", name)
 
     def _duplicate_scenario(self):
+        if self.ai_control and self.ai_control.session:
+            return
         if self.doc is None:
             return
         name, ok = QInputDialog.getText(
@@ -1588,14 +1899,11 @@ class MainWindow(QMainWindow):
         if name in self.doc.scenarios:
             self._error("That scenario name is already in use.")
             return
-        before = deepcopy(self.doc.scenarios)
-        self.doc.scenarios[name] = deepcopy(self.doc.scenario)
-        self._remember(
-            "Duplicate scenario", {"scenarios": before}, {"scenarios": deepcopy(self.doc.scenarios)}
-        )
-        self._scenario_changed(name)
+        self._command("create_scenario", name=name, source=self.doc.active_scenario)
 
     def _undo(self, forward):
+        if self.ai_control and self.ai_control.session:
+            return
         if self.doc is None or self.jobs.busy:
             return
         self._finish_motion_edit()
@@ -1635,6 +1943,8 @@ class MainWindow(QMainWindow):
             self._activate_scene()
 
     def closeEvent(self, event):
+        if self.ai_control and self.ai_control.session:
+            self.ai_control.release()
         if self.jobs.busy:
             answer = QMessageBox.question(
                 self,
@@ -1669,6 +1979,8 @@ class MainWindow(QMainWindow):
                 self.save_project()
                 return
         self.jobs.close()
+        if self.ai_control:
+            self.ai_control.close()
         event.accept()
 
 

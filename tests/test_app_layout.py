@@ -121,6 +121,8 @@ def test_long_plan_and_scenario_names_do_not_widen_sidebar(window, qapp):
         assert scroll.horizontalScrollBar().maximum() == 0
         assert page.width() <= scroll.viewport().width()
         for combo in page.findChildren(QComboBox):
+            if not combo.isVisibleTo(page):
+                continue
             left = combo.mapTo(page, QPoint()).x()
             assert left >= 0 and left + combo.width() <= page.width()
     assert window.scenario_combo.toolTip() == name

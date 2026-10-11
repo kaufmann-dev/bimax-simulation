@@ -76,6 +76,7 @@ class Jobs(QObject):
     def _run(self, operation: str, revision: int, doc: Any, kwargs: dict) -> None:
         result = None
         failure = ""
+        context = {key: kwargs.pop(key) for key in ("_control_session", "_control_job") if key in kwargs}
         try:
             with tempfile.TemporaryDirectory(prefix="bimax-job-") as directory:
                 path = Path(directory)
@@ -140,6 +141,7 @@ class Jobs(QObject):
                     result = pickle.load(stream)  # private, locally generated worker result
                 if "error" in result:
                     raise RuntimeError(result["error"])
+                result.update(context)
         except Exception as error:
             failure = str(error)
         finally:

@@ -133,7 +133,7 @@ desktop-file-install \
 
 refresh_caches
 
-printf 'BIMAX is installed at %s/bimax.\n' "$bin_dir"
+printf 'BIMAX is installed at %s/bimax; local MCP control at %s/bimax-mcp.\n' "$bin_dir" "$bin_dir"
 if [[ "$(command -v bimax || true)" != "$bin_dir/bimax" ]]; then
     printf 'Warning: %s is not first in PATH for the bimax command.\n' "$bin_dir" >&2
     printf 'Add it to your shell profile, then open a new terminal:\n' >&2

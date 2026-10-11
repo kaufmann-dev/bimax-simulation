@@ -1,4 +1,4 @@
-"""Version 3 portable projects and physical-space fragment labelmap exports."""
+"""Version 5 portable projects and physical-space fragment labelmap exports."""
 
 from __future__ import annotations
 
@@ -10,6 +10,7 @@ import shutil
 import tempfile
 import zipfile
 from dataclasses import asdict
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -19,17 +20,20 @@ from scipy import ndimage
 
 from bimax.model import (
     CUT_TYPES,
+    PROXIMAL_IDS,
     Artifact,
     Cut,
     Document,
     Geometry,
+    Measurement,
     Motion,
+    ProximalRotation,
     Review,
     Scenario,
     new_motions,
 )
 
-_VERSION = 4
+_VERSION = 5
 _MAX_METADATA = 8 * 1024 * 1024
 _MAX_VOXELS = 2**31 - 1
 _VOLUMES = ("source", "anatomy", "seeds", "barriers")
@@ -122,7 +126,7 @@ def _confirmations(value: Any, allowed: set[str]) -> None:
 def _metadata(doc: Document) -> dict[str, Any]:
     return {"format": "bimax", "version": _VERSION, "geometry": asdict(doc.geometry),
             "frame": np.asarray(doc.frame).tolist(),
-            "view_angles": list(doc.view_angles),
+            "view_angles": list(doc.view_angles), "symmetry_right": doc.symmetry_right,
             "cuts": {key: asdict(cut) for key, cut in doc.cuts.items()},
             "scenarios": {name: asdict(scenario) for name, scenario in doc.scenarios.items()},
             "reviews": {key: asdict(review) for key, review in doc.reviews.items()},
@@ -133,11 +137,13 @@ def _metadata(doc: Document) -> dict[str, Any]:
 
 def _validated_metadata(value: Any) -> tuple[Geometry, dict[str, Cut], dict[str, Scenario], dict[str, Review]]:
     if not isinstance(value, dict) or value.get("format") != "bimax" or value.get("version") != _VERSION:
-        raise ValueError("Open a version 4 project with saved orientation; older project formats require a one-time conversion.")
-    if set(value) != {"format", "version", "geometry", "frame", "view_angles", "cuts", "scenarios", "reviews", "artifacts",
+        raise ValueError("Open a version 5 project with symmetry and proximal rotations; older project formats require conversion.")
+    if set(value) != {"format", "version", "geometry", "frame", "view_angles", "symmetry_right", "cuts", "scenarios", "reviews", "artifacts",
                       "active_scenario", "anatomy_revision", "source_name", "revision", "volumes"}:
         raise ValueError("Project metadata is incomplete or unsupported.")
     geometry = _geometry(value["geometry"])
+    if value["symmetry_right"] is not None:
+        _vector([value["symmetry_right"]], 1, "Symmetry reference Right offset")
     _vector(value["view_angles"], 3, "Whole-skull orientation")
     if any(abs(angle) > 180 for angle in value["view_angles"]):
         raise ValueError("Whole-skull orientation must be between -180 and 180 degrees.")
@@ -172,7 +178,7 @@ def _validated_metadata(value: Any) -> tuple[Geometry, dict[str, Cut], dict[str,
     if not isinstance(value["scenarios"], dict) or not 1 <= len(value["scenarios"]) <= _MAX_CONFIGURATIONS:
         raise ValueError("A project needs between 1 and 256 movement scenarios.")
     for name, data in value["scenarios"].items():
-        if (not _name(name) or not isinstance(data, dict) or set(data) != {"cut_ids", "motions", "landmarks"}
+        if (not _name(name) or not isinstance(data, dict) or set(data) != {"cut_ids", "motions", "landmarks", "proximal_rotations", "measurements"}
                 or not isinstance(data["cut_ids"], list) or any(not isinstance(k, str) or k not in cuts for k in data["cut_ids"])
                 or len(set(data["cut_ids"])) != len(data["cut_ids"])
                 or not isinstance(data["motions"], dict) or set(data["motions"]) != set(new_motions())):
@@ -188,9 +194,15 @@ def _validated_metadata(value: Any) -> tuple[Geometry, dict[str, Cut], dict[str,
             for field in ("translation", "angles", "pivot"):
                 _vector(motion[field], 3, f"{name} {key} {field}")
             motions[key] = Motion(**motion)
+            from .engine import motion_matrix
+            motion_matrix(motions[key])
         landmarks = data["landmarks"]
-        active_ids = ids - {fid for fid in ids if fid.startswith("upper:")} | {
+        active_ids = {"skull", "mandible", "excluded", "unassigned"} | {
             f"upper:{key}" for key in data["cut_ids"] if cuts[key].kind == "lefort"}
+        if "bsso" in data["cut_ids"]:
+            active_ids.update(PROXIMAL_IDS)
+        if "genio" in data["cut_ids"]:
+            active_ids.add("chin")
         if not isinstance(landmarks, list):
             raise ValueError("Scenario landmarks must be a list.")
         for landmark in landmarks:
@@ -199,7 +211,40 @@ def _validated_metadata(value: Any) -> tuple[Geometry, dict[str, Cut], dict[str,
                     or landmark["fragment"] not in active_ids):
                 raise ValueError("Invalid scenario landmark.")
             _vector(landmark["point"], 3, "Landmark point")
-        scenarios[name] = Scenario(data["cut_ids"], motions, landmarks)
+        if len({item["name"] for item in landmarks}) != len(landmarks):
+            raise ValueError("Landmark names must be unique within each scenario.")
+        proximal = data["proximal_rotations"]
+        if not isinstance(proximal, dict) or set(proximal) != set(PROXIMAL_IDS):
+            raise ValueError("A scenario requires left and right proximal rotation controls.")
+        proximal_rotations = {}
+        for key, rotation in proximal.items():
+            if (not isinstance(rotation, dict) or set(rotation) != {"angles", "pivot", "pivot_set"}
+                    or type(rotation["pivot_set"]) is not bool):
+                raise ValueError("Invalid proximal rotation; translation is unsupported.")
+            for field in ("angles", "pivot"):
+                _vector(rotation[field], 3, f"{key} {field}")
+            control = ProximalRotation(**rotation)
+            motion_matrix(Motion(angles=control.angles, pivot=control.pivot, pivot_set=control.pivot_set))
+            proximal_rotations[key] = control
+        definitions = data["measurements"]
+        if not isinstance(definitions, dict) or len(definitions) > 256:
+            raise ValueError("Scenario measurement definitions must be a named mapping with at most 256 entries.")
+        measurements = {}
+        for measurement_name, definition in definitions.items():
+            if (not _name(measurement_name) or not isinstance(definition, dict)
+                    or set(definition) != {"kind", "landmarks"}
+                    or not isinstance(definition["kind"], str) or not isinstance(definition["landmarks"], dict)
+                    or any(not _name(key) or not _name(item) for key, item in definition["landmarks"].items())):
+                raise ValueError("Invalid named measurement definition.")
+            measurements[measurement_name] = Measurement(**definition)
+        scenarios[name] = Scenario(data["cut_ids"], motions, landmarks, proximal_rotations, measurements)
+        from .symmetry import validate_definition
+        empty = np.zeros((1, 1, 1), dtype=np.uint8)
+        planning = Document(geometry, empty, empty, empty, empty, cuts=cuts,
+                            scenarios={name: scenarios[name]}, active_scenario=name,
+                            symmetry_right=value["symmetry_right"])
+        for definition in measurements.values():
+            validate_definition(planning, definition)
     if not isinstance(value["active_scenario"], str) or value["active_scenario"] not in scenarios:
         raise ValueError("Active scenario is missing from the project.")
     reviews = {}
@@ -318,14 +363,29 @@ def _unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     return result
 
 
-def save_project(doc: Document, path: str | Path) -> None:
+def file_version(path: str | Path) -> list[int] | None:
+    try:
+        stat = Path(path).stat(follow_symlinks=False)
+    except FileNotFoundError:
+        return None
+    return [stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns]
+
+
+_UNSPECIFIED = object()
+
+
+def save_project(doc: Document, path: str | Path, *, expected_version: Any = _UNSPECIFIED) -> None:
     """Save source-of-truth state plus current prepared artifacts atomically."""
     from bimax.engine import validate_fragment_preview
     from bimax.prepared import MAX_ARTIFACT_BYTES, prepare_geometry, prune_references, read
 
     destination = Path(path).absolute()
-    if destination.suffix.lower() != ".bimax" or destination.is_symlink():
+    if destination.suffix.lower() != ".bimax" or destination.is_symlink() or (destination.exists() and not destination.is_file()):
         raise ValueError("Choose a regular .bimax project filename.")
+    if expected_version is _UNSPECIFIED:
+        expected_version = file_version(destination)
+    if file_version(destination) != expected_version:
+        raise ValueError("External file conflict. Reopen the project or save to another filename.")
     _validated_metadata(_metadata(doc))
     _validate_arrays(doc)
     validate_reviews(doc)
@@ -362,11 +422,22 @@ def save_project(doc: Document, path: str | Path) -> None:
                 archive.write(ref.path, f"artifacts/{key}.npz")
         with archive_path.open("rb") as stream:
             os.fsync(stream.fileno())
+        if file_version(destination) != expected_version:
+            raise ValueError("External file conflict. Reopen the project or save to another filename.")
+        if expected_version is not None:
+            stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S.%fZ")
+            backup = destination.with_name(f"{destination.stem}.backup-{stamp}.bimax")
+            with destination.open("rb") as original, backup.open("xb") as copy_stream:
+                shutil.copyfileobj(original, copy_stream)
+                copy_stream.flush()
+                os.fsync(copy_stream.fileno())
+            if file_version(destination) != expected_version:
+                raise ValueError("External file conflict during backup. Save to another filename.")
         os.replace(archive_path, destination)
 
 
 def load_project(path: str | Path) -> Document:
-    """Load version 4 only; restore portable artifacts to the private local cache."""
+    """Load version 5 only; restore portable artifacts to the private local cache."""
     from bimax.prepared import MAX_ARTIFACT_BYTES, artifact_path, file_digest
 
     try:
@@ -422,7 +493,7 @@ def load_project(path: str | Path) -> Document:
             doc = Document(geometry=geometry, source=arrays["source"], anatomy=arrays["anatomy"],
                            seeds=arrays["seeds"], barriers=arrays["barriers"],
                            frame=np.asarray(metadata["frame"], dtype=float), cuts=cuts, scenarios=scenarios,
-                           view_angles=list(metadata["view_angles"]),
+                           view_angles=list(metadata["view_angles"]), symmetry_right=metadata["symmetry_right"],
                            reviews=reviews, artifacts=refs, active_scenario=metadata["active_scenario"],
                            anatomy_revision=metadata["anatomy_revision"], source_name=metadata["source_name"],
                            revision=metadata["revision"])

@@ -16,7 +16,7 @@ def anatomy_counts(labels):
 def execute(operation, doc, options):
     from .engine import default_cuts, load_volume, separate, validate_fragment_preview
     from .prepared import anatomy_display, load_geometry, prepare_geometry
-    from .storage import export_labelmaps, load_project, save_project
+    from .storage import export_labelmaps, file_version, load_project, save_project
     from .surface_cache import cached_surfaces
 
     def progress(fraction, message):
@@ -31,6 +31,7 @@ def execute(operation, doc, options):
         except (OSError, ValueError, KeyError):
             return {"needs_preparation": True, "configuration_key": options["key"], "document_id": options["document_id"]}
     if operation in ("import", "open"):
+        version = file_version(options["path"])
         doc = load_volume(options["path"], progress=progress) if operation == "import" else load_project(options["path"])
         if not doc.cuts:
             doc.cuts = default_cuts(doc)
@@ -41,7 +42,9 @@ def execute(operation, doc, options):
             validate_fragment_preview(doc, result["fragments"], result["fragment_counts"], counts)
             doc.fragments, doc.fragments_key = result["fragments"], doc.configuration_key
             surface_sets[True] = result["surfaces"]
-        return {"document": doc, "surface_sets": surface_sets,
+        if file_version(options["path"]) != version:
+            raise ValueError("External file conflict during loading. Retry opening the file.")
+        return {"file_version": version, "document": doc, "surface_sets": surface_sets,
                 "fragment_mode": doc.fragments is not None, "path": options["path"], "anatomy_counts": counts}
     if operation == "separate":
         labels = separate(doc, roi=options.get("roi"), progress=progress)
@@ -69,8 +72,12 @@ def execute(operation, doc, options):
         from .engine import component_indices
         return {"indices": component_indices(doc, options["xyz"]), "label": options["label"]}
     if operation == "save":
-        save_project(doc, options["path"])
-        return {"path": options["path"], "artifacts": doc.artifacts}
+        # Provisional display geometry is transient; all source planning edits persist.
+        if not doc.cuts_accepted:
+            doc.fragments, doc.fragments_key = None, None
+        kwargs = {"expected_version": options["expected_version"]} if "expected_version" in options else {}
+        save_project(doc, options["path"], **kwargs)
+        return {"path": options["path"], "artifacts": doc.artifacts, "file_version": file_version(options["path"]), "document_id": doc._identity}
     if operation == "export":
         return {"path": str(export_labelmaps(doc, options["path"])), "artifacts": doc.artifacts}
     raise ValueError(f"Unknown computation: {operation}")

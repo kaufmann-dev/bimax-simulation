@@ -604,10 +604,14 @@ def motion_matrix(motion: Motion) -> np.ndarray:
 
 
 def fragment_transforms(doc: Document) -> dict[int, np.ndarray]:
-    """Baseline LPS-to-moved-LPS matrices; proximal fragments remain fixed."""
+    """Baseline LPS-to-moved-LPS matrices; proximal rotations have no inheritance."""
     linked = motion_matrix(doc.motions["linked"])
     mandible = linked @ motion_matrix(doc.motions["mandible"])
     planning = {5: mandible}
+    if "bsso" in doc.scenario.cut_ids:
+        for key, label in (("left-proximal", 3), ("right-proximal", 4)):
+            rotation = doc.scenario.proximal_rotations[key]
+            planning[label] = motion_matrix(Motion(angles=rotation.angles, pivot=rotation.pivot, pivot_set=rotation.pivot_set))
     inherited = linked
     for key in reversed(doc.upper_cuts):
         inherited = inherited @ motion_matrix(doc.motions[key])

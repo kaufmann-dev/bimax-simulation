@@ -83,6 +83,7 @@ def test_project_roundtrip_preserves_shared_anatomy_plans_and_scenarios(tmp_path
     doc.scenario.landmarks = [{"name": "Maxillary reference", "point": [1.2, 3.4, 5.6], "fragment": "upper:lefort1"}]
     doc.motions["linked"].translation = [1.0, 6.0, -2.0]
     doc.motions["mandible"].angles = [12.0, 3.0, -4.0]
+    doc.motions["mandible"].pivot_set = True
     doc.motions["chin"].pivot = [3.0, -4.0, 5.0]
     doc.motions["chin"].pivot_set = True
     doc.revision = 17
@@ -104,7 +105,7 @@ def test_project_roundtrip_preserves_shared_anatomy_plans_and_scenarios(tmp_path
             "project.json", "volumes/source.nii.gz", "volumes/anatomy.nii.gz",
             "volumes/seeds.nii.gz", "volumes/barriers.nii.gz",
         }
-        assert json.loads(archive.read("project.json"))["version"] == 4
+        assert json.loads(archive.read("project.json"))["version"] == 5
     assert restored.view_angles == [7.5, -3.0, 2.0]
     restored.motions["linked"].translation[0] = 100
     restored.scenario.landmarks[0]["point"][0] = 100
@@ -204,7 +205,7 @@ def test_version_one_rejection_explains_new_format(tmp_path):
     path = tmp_path / "old.bimax"
     save_project(phantom(), path)
     rewrite_archive(path, lambda metadata: metadata.__setitem__("version", 1))
-    with pytest.raises(ValueError, match="version 4 project"):
+    with pytest.raises(ValueError, match="version 5 project"):
         load_project(path)
 
 
@@ -390,3 +391,63 @@ def test_nested_export_preserves_fragment_identity_and_parent_relative_transform
     for item in manifest["fragments"]:
         np.testing.assert_allclose(item["transform_lps"], transforms[item["id"]])
         assert item["anatomy"] == doc.fragment_descriptors[item["id"]].anatomy
+
+
+def test_overwrite_backup_and_external_conflict(tmp_path):
+    from bimax.storage import file_version
+    doc = phantom()
+    path = tmp_path / "working.bimax"
+    save_project(doc, path)
+    original, version = path.read_bytes(), file_version(path)
+    doc.view_angles = [10, 0, 0]
+    save_project(doc, path, expected_version=version)
+    backups = list(tmp_path.glob("working.backup-*.bimax"))
+    assert len(backups) == 1 and backups[0].read_bytes() == original
+    assert load_project(path).view_angles == [10, 0, 0]
+    version = file_version(path)
+    path.write_bytes(b"external edit")
+    with pytest.raises(ValueError, match="External file conflict"):
+        save_project(doc, path, expected_version=version)
+    assert path.read_bytes() == b"external edit"
+    assert list(tmp_path.glob("working.backup-*.bimax")) == backups
+
+
+def test_external_change_during_save_is_detected_before_backup_or_replace(tmp_path, monkeypatch):
+    from bimax.storage import file_version
+    doc = phantom()
+    path = tmp_path / "working.bimax"
+    save_project(doc, path)
+    version = file_version(path)
+    original_writer = sitk.WriteImage
+    changed = []
+    def external_writer(*arguments):
+        if not changed:
+            path.write_bytes(b"another editor changed the file")
+            changed.append(True)
+        original_writer(*arguments)
+    monkeypatch.setattr(sitk, "WriteImage", external_writer)
+    with pytest.raises(ValueError, match="External file conflict"):
+        save_project(doc, path, expected_version=version)
+    assert path.read_bytes() == b"another editor changed the file"
+    assert not list(tmp_path.glob("working.backup-*.bimax"))
+
+
+def test_failed_atomic_replacement_preserves_original_and_backup(tmp_path, monkeypatch):
+    import os
+    doc = phantom()
+    path = tmp_path / "working.bimax"
+    save_project(doc, path)
+    original = path.read_bytes()
+    replace = os.replace
+    def fail_project(source, destination):
+        if destination == path:
+            raise OSError("simulated replacement failure")
+        return replace(source, destination)
+    monkeypatch.setattr(os, "replace", fail_project)
+    doc.view_angles = [10, 0, 0]
+    with pytest.raises(OSError, match="replacement failure"):
+        save_project(doc, path)
+    assert path.read_bytes() == original
+    backups = list(tmp_path.glob("working.backup-*.bimax"))
+    assert len(backups) == 1 and backups[0].read_bytes() == original
+    assert not list(tmp_path.glob(".bimax-save-*"))
