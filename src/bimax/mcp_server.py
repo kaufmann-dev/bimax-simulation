@@ -256,7 +256,7 @@ def make_server(connection):
 
     return Server(
         "bimax-simulation",
-        version="0.1.0",
+        version="0.2.0",
         on_list_tools=list_tools,
         on_call_tool=call_tool,
         instructions="Connect, inspect state, begin an editing session, target scenarios by name, preview and poll for PNG, revise, explicitly save, then end the session. Never accept cuts merely by previewing.",

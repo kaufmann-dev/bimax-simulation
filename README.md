@@ -151,11 +151,11 @@ uv run bimax
 
 ## Publish a release
 
-Set the new version in `pyproject.toml` and the first `<release>` in `packaging/linux/app.bimax.simulator.metainfo.xml`. After the commit is on `main`, tag and push it:
+Set the new version in `pyproject.toml`, the first `<release>` in `packaging/linux/app.bimax.simulator.metainfo.xml`, and the MCP server version in `src/bimax/mcp_server.py`, then run `uv lock`. After the commit is on `main`, tag and push it:
 
 ```sh
-git tag v0.1.0
-git push origin v0.1.0
+git tag v0.2.0
+git push origin v0.2.0
 ```
 
 The Release workflow verifies that the tag matches both versions and publishes a GitHub release. The piped installer always installs the latest release.
