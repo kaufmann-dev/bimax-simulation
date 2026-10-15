@@ -69,13 +69,16 @@ EXPORT_VIEWS = (
     ("birds-eye", "Bird's-eye", np.array([0.0, np.cos(np.deg2rad(40)), np.sin(np.deg2rad(40))]), np.array([0.0, 0.0, 1.0])),
 )
 EXPORT_IMAGE_SIZE = 2048
-# Report pages add obliques and a submental view to the standard exports.
-REPORT_VIEWS = EXPORT_VIEWS + (
+# Report views: lateral and frontal first, then obliques and the submental view.
+REPORT_VIEWS = (
+    EXPORT_VIEWS[0],
+    EXPORT_VIEWS[2],
+    EXPORT_VIEWS[1],
     ("front-right", "Front-right oblique", np.array([np.sqrt(0.5), np.sqrt(0.5), 0.0]), np.array([0.0, 0.0, 1.0])),
     ("front-left", "Front-left oblique", np.array([-np.sqrt(0.5), np.sqrt(0.5), 0.0]), np.array([0.0, 0.0, 1.0])),
     ("inferior", "Inferior", np.array([0.0, 0.0, -1.0]), np.array([0.0, 1.0, 0.0])),
 )
-REPORT_IMAGE_SIZE = 1200
+REPORT_IMAGE_SIZE = 1600
 
 
 class SliceView(QWidget):
