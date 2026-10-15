@@ -14,6 +14,8 @@ from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
     QComboBox,
+    QDialog,
+    QDialogButtonBox,
     QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
@@ -25,6 +27,7 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QMainWindow,
     QMessageBox,
+    QPlainTextEdit,
     QPushButton,
     QScrollArea,
     QSizePolicy,
@@ -460,6 +463,7 @@ class MainWindow(QMainWindow):
         self._build_measurements(layout)
         button("Save project…", self.save_project, layout)
         self.image_export_button = button("Export scenario images…", self._export_images, layout)
+        self.report_button = button("Export scenario report (PDF)…", self._export_report, layout)
         self.export_button = button("Export fragment labelmaps…", self._export, layout)
         layout.addStretch()
 
@@ -718,6 +722,7 @@ class MainWindow(QMainWindow):
             can_export = self.doc is not None and self.doc.fragments is not None and not busy
             self.export_button.setEnabled(can_export)
             self.image_export_button.setEnabled(can_export)
+            self.report_button.setEnabled(can_export and self.doc is not None and self.doc.cuts_accepted)
             self.accept_cuts_button.setEnabled(self.pending_fragments is not None)
             can_move = self.doc is not None and self.doc.fragments is not None and not busy
             self.motion_combo.setEnabled(can_move)
@@ -1022,6 +1027,63 @@ class MainWindow(QMainWindow):
             self._error(failure)
         else:
             self._status(f"Exported {len(exported)} scenario images to {exported[0].parent}.")
+
+    def _case_details(self):
+        from .report import CaseInfo
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Scenario report details")
+        form = QFormLayout(dialog)
+        form.addRow(QLabel("Optional. Printed in the report only; not saved in the project."))
+        fields = {key: QLineEdit() for key in ("patient", "birth_date", "case_id", "surgeon")}
+        for key, label in zip(fields, ("Patient", "Date of birth", "Case ID", "Surgeon / planner"), strict=True):
+            form.addRow(label, fields[key])
+        notes = QPlainTextEdit()
+        notes.setMaximumHeight(110)
+        form.addRow("Notes", notes)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        form.addRow(buttons)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return None
+        return CaseInfo(**{key: field.text().strip() for key, field in fields.items()},
+                        notes=notes.toPlainText().strip())
+
+    def _export_report(self):
+        if self.doc is None or self.doc.fragments is None or self.jobs.busy:
+            return
+        if not self.doc.cuts_accepted:
+            self._error("Review and accept the active cut combination before exporting a report.")
+            return
+        case = self._case_details()
+        if case is None:
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export scenario report", f"{self.doc.active_scenario}-report.pdf", "PDF (*.pdf)"
+        )
+        if not path:
+            return
+        if not path.lower().endswith(".pdf"):
+            path += ".pdf"
+        from .report import export_report
+
+        self._status("Rendering pre-op and planned views for the report…")
+        QApplication.setOverrideCursor(QCursor(Qt.CursorShape.WaitCursor))
+        try:
+            exported = export_report(
+                self.views, self.doc, path, project_path=self.project_path, dirty=self.dirty, case=case
+            )
+        except Exception as error:
+            failure = str(error) or "Could not export the scenario report."
+        else:
+            failure = ""
+        finally:
+            QApplication.restoreOverrideCursor()
+        if failure:
+            self._error(failure)
+        else:
+            self._status(f"Scenario report exported: {exported}")
 
     def _job_finished(self, operation, revision, result):
         if "_control_session" in result:

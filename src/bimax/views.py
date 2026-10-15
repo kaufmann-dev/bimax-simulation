@@ -69,6 +69,13 @@ EXPORT_VIEWS = (
     ("birds-eye", "Bird's-eye", np.array([0.0, np.cos(np.deg2rad(40)), np.sin(np.deg2rad(40))]), np.array([0.0, 0.0, 1.0])),
 )
 EXPORT_IMAGE_SIZE = 2048
+# Report pages add obliques and a submental view to the standard exports.
+REPORT_VIEWS = EXPORT_VIEWS + (
+    ("front-right", "Front-right oblique", np.array([np.sqrt(0.5), np.sqrt(0.5), 0.0]), np.array([0.0, 0.0, 1.0])),
+    ("front-left", "Front-left oblique", np.array([-np.sqrt(0.5), np.sqrt(0.5), 0.0]), np.array([0.0, 0.0, 1.0])),
+    ("inferior", "Inferior", np.array([0.0, 0.0, -1.0]), np.array([0.0, 1.0, 0.0])),
+)
+REPORT_IMAGE_SIZE = 1200
 
 
 class SliceView(QWidget):
@@ -900,19 +907,45 @@ class FourViews(QWidget):
         painter.end()
         return sheet
 
-    def export_scenario_images(self, output_dir: str | Path) -> list[Path]:
-        """Export four standardized moved-fragment views and a contact sheet."""
+    def _actor_matrices(self) -> dict[int, Any]:
+        return {label: actor.GetUserMatrix() for label, actor in self.actors.items()}
+
+    def _restore_matrices(self, matrices: dict[int, Any]) -> None:
+        for label, matrix in matrices.items():
+            self.actors[label].SetUserMatrix(matrix)
+
+    def _clear_matrices(self) -> None:
+        for actor in self.actors.values():
+            actor.SetUserMatrix(vtkMatrix4x4())
+
+    def comparison_bounds(self) -> tuple[np.ndarray, np.ndarray]:
+        """Visible bounds covering both baseline and moved positions."""
+        visible = [actor for actor in self.actors.values() if actor.GetVisibility()]
+        if not visible:
+            raise ValueError("Select at least one visible structure before exporting scenario images.")
+        moved = self._visible_bounds(visible)
+        matrices = self._actor_matrices()
+        try:
+            self._clear_matrices()
+            baseline = self._visible_bounds(visible)
+        finally:
+            self._restore_matrices(matrices)
+        return np.minimum(moved[0], baseline[0]), np.maximum(moved[1], baseline[1])
+
+    def render_views(
+        self,
+        views: tuple[tuple[str, str, np.ndarray, np.ndarray], ...],
+        size: int,
+        *,
+        baseline: bool = False,
+        bounds: tuple[np.ndarray, np.ndarray] | None = None,
+    ) -> list[tuple[str, QImage]]:
+        """Render standardized square views, restoring the interactive scene."""
         if self.document is None or self.document.fragments is None or not self.fragment_mode:
             raise ValueError("Build and review the selected cuts before exporting scenario images.")
         visible = [actor for actor in self.actors.values() if actor.GetVisibility()]
         if not visible:
             raise ValueError("Select at least one visible structure before exporting scenario images.")
-
-        destination = Path(output_dir).absolute()
-        if destination.is_symlink() or destination.exists():
-            raise ValueError("Image export destination must be a new folder.")
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        temporary = Path(tempfile.mkdtemp(prefix=".bimax-image-export-", dir=destination.parent))
         camera = self.renderer.GetActiveCamera()
         camera_before = vtkCamera()
         camera_before.DeepCopy(camera)
@@ -920,11 +953,14 @@ class FourViews(QWidget):
         hidden = list(self.baseline_actors.values()) + self.landmark_actors + [self.pivot_actor]
         visibility_before = [(actor, actor.GetVisibility()) for actor in hidden]
         plane_enabled = bool(self.plane_widget.GetEnabled())
+        matrices = self._actor_matrices()
         try:
             for actor in hidden:
                 actor.SetVisibility(False)
             if plane_enabled:
                 self.plane_widget.SetEnabled(False)
+            if baseline:
+                self._clear_matrices()
 
             window_size = self.vtk.GetRenderWindow().GetSize()
             side = min(window_size)
@@ -934,10 +970,10 @@ class FourViews(QWidget):
             # repeats its black margins inside every tile, cutting bands out
             # of the anatomy. Capture the full viewport and crop only afterward.
             self.renderer.SetViewport(0, 0, 1, 1)
-            low, high = self._visible_bounds(visible)
-            magnification = max(1, -(-EXPORT_IMAGE_SIZE // side))
+            low, high = bounds if bounds is not None else self._visible_bounds(visible)
+            magnification = max(1, -(-size // side))
             rendered: list[tuple[str, QImage]] = []
-            for filename, label, direction, up in EXPORT_VIEWS:
+            for _, label, direction, up in views:
                 self._set_export_camera(
                     self._export_direction(direction), self._export_direction(up), low, high
                 )
@@ -959,19 +995,15 @@ class FourViews(QWidget):
                     crop_size,
                     crop_size,
                 ).scaled(
-                    EXPORT_IMAGE_SIZE,
-                    EXPORT_IMAGE_SIZE,
+                    size,
+                    size,
                     Qt.AspectRatioMode.IgnoreAspectRatio,
                     Qt.TransformationMode.SmoothTransformation,
                 )
-                self._save_png(image, temporary / f"{filename}.png")
                 rendered.append((label, image))
-            self._save_png(self._contact_sheet(rendered), temporary / "contact-sheet.png")
-            os.replace(temporary, destination)
-        except Exception:
-            shutil.rmtree(temporary, ignore_errors=True)
-            raise
+            return rendered
         finally:
+            self._restore_matrices(matrices)
             self.renderer.SetViewport(*viewport_before)
             camera.DeepCopy(camera_before)
             for actor, visible_before in visibility_before:
@@ -979,6 +1011,28 @@ class FourViews(QWidget):
             if plane_enabled:
                 self.plane_widget.SetEnabled(True)
             self.request_render()
+
+    def export_scenario_images(self, output_dir: str | Path) -> list[Path]:
+        """Export four standardized moved-fragment views and a contact sheet."""
+        if self.document is None or self.document.fragments is None or not self.fragment_mode:
+            raise ValueError("Build and review the selected cuts before exporting scenario images.")
+        if not any(actor.GetVisibility() for actor in self.actors.values()):
+            raise ValueError("Select at least one visible structure before exporting scenario images.")
+
+        destination = Path(output_dir).absolute()
+        if destination.is_symlink() or destination.exists():
+            raise ValueError("Image export destination must be a new folder.")
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        temporary = Path(tempfile.mkdtemp(prefix=".bimax-image-export-", dir=destination.parent))
+        try:
+            rendered = self.render_views(EXPORT_VIEWS, EXPORT_IMAGE_SIZE)
+            for (filename, *_), (_, image) in zip(EXPORT_VIEWS, rendered, strict=True):
+                self._save_png(image, temporary / f"{filename}.png")
+            self._save_png(self._contact_sheet(rendered), temporary / "contact-sheet.png")
+            os.replace(temporary, destination)
+        except Exception:
+            shutil.rmtree(temporary, ignore_errors=True)
+            raise
         return [destination / f"{filename}.png" for filename, *_ in EXPORT_VIEWS] + [
             destination / "contact-sheet.png"
         ]

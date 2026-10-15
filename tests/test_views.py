@@ -541,3 +541,54 @@ def test_expand_3d_before_loading_document(qapp):
     qapp.processEvents()
     assert all(view.isVisible() for view in widget.slices)
     widget.close()
+
+
+def test_render_views_baseline_uses_identity_shared_bounds_and_restores_scene(qapp, monkeypatch):
+    seen = []
+
+    class FakeRenderLargeImage:
+        def SetInput(self, renderer):
+            self.renderer = renderer
+
+        def SetMagnification(self, value):
+            pass
+
+        def Update(self):
+            matrix = widget.actors[2].GetUserMatrix()
+            seen.append(matrix.GetElement(1, 3))
+            self.image = vtkImageData()
+            self.image.SetDimensions(40, 40, 1)
+            self.image.GetPointData().SetScalars(numpy_to_vtk(np.full((1600, 3), 90, dtype=np.uint8), deep=True))
+
+        def GetOutput(self):
+            return self.image
+
+    monkeypatch.setattr(views, "vtkRenderLargeImage", FakeRenderLargeImage)
+    doc = document()
+    doc.fragments = doc.anatomy.copy()
+    doc.accept_review()
+    doc.fragments_key = doc.configuration_key
+    widget = FourViews()
+    widget.resize(600, 500)
+    widget.show()
+    widget.initialize()
+    widget.set_document(doc)
+    widget.set_surfaces(make_surfaces(doc.fragments, doc.geometry), fragment_mode=True)
+    transform = np.eye(4)
+    transform[:3, 3] = [0, 30, 0]
+    widget.set_transforms({2: transform})
+    camera = widget.renderer.GetActiveCamera()
+    camera_state = (camera.GetPosition(), camera.GetFocalPoint(), camera.GetViewUp())
+
+    low, high = widget.comparison_bounds()
+    moved_low, moved_high = FourViews._visible_bounds(list(widget.actors.values()))
+    assert high[1] == pytest.approx(moved_high[1])
+    assert low[1] == pytest.approx(moved_low[1] - 30)
+    rendered = widget.render_views(views.REPORT_VIEWS, 32, baseline=True, bounds=(low, high))
+
+    assert [label for label, _ in rendered] == [label for _, label, *_ in views.REPORT_VIEWS]
+    assert all(image.width() == 32 for _, image in rendered)
+    assert seen == [0] * len(views.REPORT_VIEWS)
+    assert widget.actors[2].GetUserMatrix().GetElement(1, 3) == 30
+    assert (camera.GetPosition(), camera.GetFocalPoint(), camera.GetViewUp()) == camera_state
+    widget.close()

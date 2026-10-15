@@ -110,6 +110,8 @@ Overwriting an existing project creates a timestamped `.backup-<UTC timestamp>.b
 
 **Export scenario images** writes right, left, front and bird's-eye PNGs plus a labeled contact sheet for the active scenario. Bird's-eye looks down toward the face from 40° above the front. The images use the visible moved bone surfaces and the corrected head reference frame; they do not model soft-tissue appearance.
 
+**Export scenario report (PDF)** writes an A4 summary of the active scenario for surgeons and planners. It asks for optional patient name, date of birth, case ID, surgeon and notes. These are printed in the report and page footers but never saved in the project. The report includes pre-op and planned views from seven angles (right, left, front, bird's-eye, both front obliques, and inferior), each pair rendered with the same camera and scale. It also lists every movement control with translation, rotation, pivot and inheritance; the proximal rotations; the full cut geometry and confirmation points; fragment volumes, centroid displacements and composite transforms; landmarks; symmetry measurements; the volume geometry, head reference and display orientation; and the coordinate and sign conventions. The combination must be accepted first. Images use the visible structures, and the report names any hidden ones. Projects with unsaved changes are flagged in the report.
+
 ## Local MCP control
 
 Configure an MCP client with the installed stdio server. The official Python SDK is pinned to `mcp==2.3.0`; diagnostics go to stderr. For this checkout's installation:

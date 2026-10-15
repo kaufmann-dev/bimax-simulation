@@ -513,6 +513,28 @@ def test_export_scenario_images_uses_active_scene_and_does_not_dirty_project(
     assert not window.dirty
 
 
+def test_export_scenario_report_passes_case_details_and_does_not_dirty_project(
+    window, tmp_path, monkeypatch
+):
+    import bimax.report as report
+
+    install_document(window, synthetic_document(assigned=True, fragments=True))
+    assert window.report_button.isEnabled()
+    case = report.CaseInfo(patient="Jane Doe", case_id="C-1")
+    recorded = []
+    monkeypatch.setattr(window, "_case_details", lambda: case)
+    monkeypatch.setattr(QFileDialog, "getSaveFileName", lambda *args: (str(tmp_path / "plan"), "PDF (*.pdf)"))
+    monkeypatch.setattr(
+        report, "export_report", lambda views, doc, path, **kwargs: recorded.append((path, kwargs)) or path
+    )
+
+    window._export_report()
+
+    assert recorded == [(str(tmp_path / "plan.pdf"), {"project_path": None, "dirty": False, "case": case})]
+    assert "Scenario report exported" in window.statusBar().currentMessage()
+    assert not window.dirty
+
+
 def test_movement_undo_redo_retains_accepted_fragments(window, qapp):
     doc = synthetic_document(assigned=True, fragments=True)
     install_document(window, doc)
