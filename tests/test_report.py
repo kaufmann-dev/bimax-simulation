@@ -1,4 +1,4 @@
-"""Scenario report data completeness and paginated PDF output."""
+"""Surgeon-facing scenario report content and paginated PDF output."""
 
 import os
 import re
@@ -12,9 +12,17 @@ from PySide6.QtGui import QColor, QImage
 from PySide6.QtWidgets import QApplication
 
 from bimax.commands import Commands
-from bimax.engine import fragment_transforms
+from bimax.engine import motion_matrix
 from bimax.history import History
-from bimax.report import CaseInfo, export_report, report_data, write_report_pdf
+from bimax.model import Motion
+from bimax.report import (
+    CaseInfo,
+    crop_pair,
+    export_report,
+    movement_terms,
+    report_data,
+    write_report_pdf,
+)
 
 
 @pytest.fixture(scope="module")
@@ -44,46 +52,68 @@ def planned_document():
     return doc
 
 
-def test_report_data_contains_every_parameter_needed_to_rebuild_the_scenario():
+def test_movement_terms_match_engine_rotation_signs():
+    pivot = [0.0, 0.0, 0.0]
+    anterior, right = np.array([0, 10, 0, 1.0]), np.array([10, 0, 0, 1.0])
+    pitch = motion_matrix(Motion(angles=[5, 0, 0], pivot=pivot, pivot_set=True))
+    roll = motion_matrix(Motion(angles=[0, 5, 0], pivot=pivot, pivot_set=True))
+    yaw = motion_matrix(Motion(angles=[0, 0, 5], pivot=pivot, pivot_set=True))
+    assert (pitch @ anterior)[2] > 0
+    assert (roll @ right)[2] < 0
+    assert (yaw @ anterior)[0] < 0
+    assert movement_terms([0, 0, 0], [5, 5, 5]) == [
+        ("Pitch", "5.0° counterclockwise (anterior up)"),
+        ("Roll (cant)", "5.0° right side down"),
+        ("Yaw", "5.0° front toward the patient's left"),
+    ]
+    assert movement_terms([-1, -2, 3], [0, 0, 0]) == [
+        ("Setback", "2.0 mm back"),
+        ("Impaction", "3.0 mm up"),
+        ("Transverse shift", "1.0 mm to the patient's left"),
+    ]
+
+
+def test_report_data_describes_each_operation_segment_for_a_surgeon():
     doc = planned_document()
     data = report_data(doc, project_path="/cases/a.bimax", dirty=False,
                        case=CaseInfo(patient="Jane Doe", case_id="C-1"), hidden=["Fixed skull"])
 
-    controls = {control["key"]: control for control in data["controls"]}
-    assert list(controls) == ["linked", "lefort1", "mandible", "chin", "left-proximal", "right-proximal"]
-    assert controls["linked"]["translation"] == [1, 3, -2]
-    assert controls["linked"]["ui"] == {"right": 1, "advance": 3, "downgraft": 2}
-    assert controls["linked"]["angles"] == [4, 0, 0]
-    assert controls["linked"]["pivot"] == [10, 10, 10] and controls["linked"]["pivot_set"]
-    assert controls["lefort1"]["parent"] == "Linked jaws"
-    assert controls["chin"]["parent"] == "Distal mandible"
-    assert controls["left-proximal"]["proximal"] and controls["left-proximal"]["angles"] == [0, 3, 0]
-    assert controls["left-proximal"]["pivot"] == [4, 2, 18]
-    assert not controls["right-proximal"]["pivot_set"]
-
-    cuts = {cut["id"]: cut for cut in data["cuts"]}
-    assert list(cuts) == ["lefort1", "bsso", "genio"]
-    planes = {row["name"]: row for row in cuts["lefort1"]["geometry"]}
-    assert planes["planes.upper"]["origin"] == doc.cuts["lefort1"].geometry["planes"]["upper"]["origin"]
-    assert planes["groups"]["value"] == [["upper"]]
-    bsso = {row["name"] for row in cuts["bsso"]["geometry"]}
-    assert {"midline", "left.front", "left.upper", "left.sagittal", "right.front"} <= bsso
-    assert {item["identity"] for item in data["confirmations"]} >= {"chin", "left-proximal", "upper:lefort1"}
-
-    fragments = {fragment["label"]: fragment for fragment in data["fragments"]}
-    np.testing.assert_allclose(fragments[6]["transform_lps"], fragment_transforms(doc)[6])
-    assert fragments[1]["hidden"] and fragments[1]["distance_mm"] == 0
-    assert sum(fragment["voxels"] for fragment in data["fragments"]) == doc.source.size
+    movements = {movement["key"]: movement for movement in data["movements"]}
+    assert list(movements) == ["linked", "lefort1", "mandible", "chin", "left-proximal", "right-proximal"]
+    assert movements["linked"]["terms"] == [
+        ("Advancement", "3.0 mm forward"),
+        ("Downgraft", "2.0 mm down"),
+        ("Transverse shift", "1.0 mm to the patient's right"),
+        ("Pitch", "4.0° counterclockwise (anterior up)"),
+    ]
+    assert movements["lefort1"]["name"] == "Maxilla (Le Fort I)"
+    assert movements["lefort1"]["relative_to"] == "Both jaws (maxillomandibular complex)"
+    assert movements["chin"]["relative_to"] == "Distal mandible (BSSO)"
+    assert movements["chin"]["terms"] == [("Advancement", "2.0 mm forward"), ("Impaction", "1.0 mm up")]
+    assert movements["left-proximal"]["terms"] == [("Roll (cant)", "3.0° right side down")]
+    assert movements["right-proximal"]["terms"] == []
+    assert data["operations"] == ["Le Fort I", "BSSO", "Genioplasty"]
 
     landmark = data["landmarks"][0]
-    assert landmark["name"] == "Pogonion" and landmark["status"] == "valid"
-    measurement = data["measurements"][0]
-    values = {value["key"]: value for value in measurement["values"]}
-    assert values["signed_lateral_mm"]["change"] == pytest.approx(
-        values["signed_lateral_mm"]["moved"] - values["signed_lateral_mm"]["baseline"]
-    )
-    assert data["symmetry_right"] == 10
-    assert data["case"]["patient"] == "Jane Doe" and data["project"] == "/cases/a.bimax"
+    assert landmark["name"] == "Pogonion" and landmark["segment"] == "Chin"
+    assert landmark["anterior"].endswith("forward")
+    values = {value["label"]: value for value in data["measurements"][0]["values"]}
+    offset = values["Offset from midline (+ right)"]
+    assert offset["change"] == pytest.approx(offset["after"] - offset["before"])
+    assert data["hidden"] == ["Fixed skull"] and data["project"] == "a.bimax"
+
+
+def test_crop_pair_uses_one_shared_content_box(qapp):
+    before = QImage(100, 80, QImage.Format.Format_RGB32)
+    before.fill(QColor("black"))
+    after = QImage(before)
+    before.setPixelColor(20, 30, QColor("white"))
+    after.setPixelColor(70, 50, QColor("white"))
+
+    cropped_before, cropped_after = crop_pair(before, after, padding=0)
+
+    assert cropped_before.size() == cropped_after.size()
+    assert (cropped_before.width(), cropped_before.height()) == (51, 21)
 
 
 def test_export_report_requires_an_accepted_combination(tmp_path):
@@ -114,4 +144,5 @@ def test_write_report_pdf_paginates_and_replaces_atomically(qapp, tmp_path):
     content = target.read_bytes()
     assert content.startswith(b"%PDF")
     assert len(re.findall(rb"/Type\s*/Page(?!s)", content)) > 3
+    assert b"Inter-Regular" in content and b"Inter-SemiBold" in content
     assert [path.name for path in tmp_path.iterdir()] == ["report.pdf"]
