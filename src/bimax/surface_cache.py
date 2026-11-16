@@ -53,7 +53,7 @@ def _key(labels: np.ndarray, geometry: Geometry) -> str:
     # Buffered C-order iteration is bounded even for a non-contiguous input.
     with np.nditer(
         labels, flags=["external_loop", "buffered", "zerosize_ok"],
-        op_flags=["readonly"], order="C", buffersize=_HASH_CHUNK // labels.dtype.itemsize,
+        op_flags=("readonly",), order="C", buffersize=_HASH_CHUNK // labels.dtype.itemsize,
     ) as chunks:
         for chunk in chunks:
             digest.update(np.asarray(chunk).tobytes())

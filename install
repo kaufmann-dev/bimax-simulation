@@ -116,7 +116,7 @@ readonly source_root
 readonly constraints="$work_dir/constraints.txt"
 uv export --frozen --no-dev --no-emit-project --no-hashes --no-header \
     --directory "$source_root" --output-file "$constraints" >/dev/null
-uv tool install --force --python 3.12 \
+uv tool install --force --python 3.14 \
     --constraints "$constraints" \
     --reinstall-package "$package_name" \
     "$source_root"

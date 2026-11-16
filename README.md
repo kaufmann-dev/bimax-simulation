@@ -20,7 +20,7 @@ Install or update to the latest release:
 curl -fsSL https://raw.githubusercontent.com/kaufmann-dev/bimax-simulation/main/install | bash
 ```
 
-The installer downloads Python 3.12 if needed, installs BIMAX into its own environment with the versions pinned in `uv.lock`, and adds the `bimax` and `bimax-mcp` commands, application launcher, icon, AppStream metadata, and `.bimax` file association. Run the same command again to update after a new release. Confirm that the user copy wins:
+The installer downloads Python 3.14 if needed, installs BIMAX into its own environment with the versions pinned in `uv.lock`, and adds the `bimax` and `bimax-mcp` commands, application launcher, icon, AppStream metadata, and `.bimax` file association. Run the same command again to update after a new release. Confirm that the user copy wins:
 
 ```sh
 command -v bimax

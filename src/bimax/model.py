@@ -195,7 +195,7 @@ class Document:
         if self._digest_revision != self.anatomy_revision:
             digest = hashlib.sha256()
             with np.nditer(self.anatomy, flags=["external_loop", "buffered", "zerosize_ok"],
-                           op_flags=["readonly"], order="C", buffersize=4 * 1024**2) as chunks:
+                           op_flags=("readonly",), order="C", buffersize=4 * 1024**2) as chunks:
                 for chunk in chunks:
                     digest.update(np.asarray(chunk).tobytes())
             self._anatomy_digest = digest.hexdigest()

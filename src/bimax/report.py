@@ -200,7 +200,7 @@ def _signed(value: float | None, digits: int = 1) -> str:
     return f"{value:+.{digits}f}".replace("-", "−")
 
 
-def _wrap(canvas: "Canvas", text: str, font: Any, width: float) -> list[str]:
+def _wrap(canvas: Canvas, text: str, font: Any, width: float) -> list[str]:
     from PySide6.QtGui import QFontMetricsF
 
     metrics, limit, lines = QFontMetricsF(font, canvas.writer), width * canvas.k, []
@@ -217,7 +217,7 @@ def _wrap(canvas: "Canvas", text: str, font: Any, width: float) -> list[str]:
     return lines
 
 
-def _tables(canvas: "Canvas", data: dict[str, Any], width: float) -> list[Table]:
+def _tables(canvas: Canvas, data: dict[str, Any], width: float) -> list[Table]:
     tables = []
     if data["case"]["notes"]:
         lines = _wrap(canvas, data["case"]["notes"], canvas.font(7.4), width - 2.4)
