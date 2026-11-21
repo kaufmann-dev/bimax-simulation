@@ -112,6 +112,12 @@ Overwriting an existing project creates a timestamped `.backup-<UTC timestamp>.b
 
 **Export scenario report (PDF)** writes a landscape A4 plan summary of the active scenario for surgeons and planners, set in black with the bundled Inter font. Before writing it asks for optional patient name, date of birth, case ID, surgeon and notes. These are printed in the page headers but never saved in the project. The overview page shows before and after right and front views next to the planned movements. Each segment is one row, indented under the segment it moves with, and the columns are AP (+ forward), vertical (+ down) and transverse (+ right) in millimetres, then pitch (+ counterclockwise), roll (+ right side down) and yaw (+ front to the left) in degrees, from the patient's perspective. Landmark movement and symmetry measurements follow. Tables that don't fit continue on a measurements page. Two more pages show before and after for right, front, left, both front obliques and inferior, each pair with the same camera, scale and crop. The combination must be accepted first. Images show the visible structures, and the report names any hidden ones.
 
+**Export aligner movements** writes the active scenario's jaw movements as `movements.toml` for the [aligners](https://github.com/kaufmann-dev/opensource-aligners) app, ready to replace the `[surgery.maxilla]` and `[surgery.mandible]` tables of its `plan.toml` (with `[surgery] mode = "manual"`).
+- **Input:** the `out/surgery/landmarks.json` of the aligners case. It holds the dental landmarks (incisor midline, canines, first molars) and the aligners head frame. The bone volume must come from the same CT.
+- **Which fragment moves each landmark:** maxilla landmarks move with the Le Fort fragment carrying the upper teeth, or stay with the fixed skull when no Le Fort cut is selected. Mandible landmarks move with the distal mandible.
+- **Values:** each landmark's displacement from the scanned occlusion, in millimetres along the aligners head axes: `forward_mm`, `up_mm` and `left_mm`. Note that `left_mm` is positive toward the patient's left, unlike the report's transverse column.
+- **Rejected:** a combination that is not accepted, landmarks farther than 3 mm from their jaw bone, and dentitions split across fragments by a cut.
+
 ## Local MCP control
 
 Configure an MCP client with the installed stdio server. The official Python SDK is pinned to `mcp==2.3.0`; diagnostics go to stderr. For this checkout's installation:

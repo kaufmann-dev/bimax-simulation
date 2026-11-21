@@ -465,6 +465,11 @@ class MainWindow(QMainWindow):
         self.image_export_button = button("Export scenario images…", self._export_images, layout)
         self.report_button = button("Export scenario report (PDF)…", self._export_report, layout)
         self.export_button = button("Export fragment labelmaps…", self._export, layout)
+        self.aligners_button = button("Export aligner movements…", self._export_aligners, layout)
+        self.aligners_button.setToolTip(
+            "Write the jaw movements as plan.toml tables for the aligners app, from the "
+            "landmarks.json of its surgery export (same CT required)."
+        )
         layout.addStretch()
 
     def _build_measurements(self, layout):
@@ -723,6 +728,7 @@ class MainWindow(QMainWindow):
             self.export_button.setEnabled(can_export)
             self.image_export_button.setEnabled(can_export)
             self.report_button.setEnabled(can_export and self.doc is not None and self.doc.cuts_accepted)
+            self.aligners_button.setEnabled(can_export and self.doc is not None and self.doc.cuts_accepted)
             self.accept_cuts_button.setEnabled(self.pending_fragments is not None)
             can_move = self.doc is not None and self.doc.fragments is not None and not busy
             self.motion_combo.setEnabled(can_move)
@@ -1084,6 +1090,33 @@ class MainWindow(QMainWindow):
             self._error(failure)
         else:
             self._status(f"Scenario report exported: {exported}")
+
+    def _export_aligners(self):
+        if self.doc is None or self.doc.fragments is None or self.jobs.busy:
+            return
+        if not self.doc.cuts_accepted:
+            self._error("Review and accept the active cut combination before exporting aligner movements.")
+            return
+        source, _ = QFileDialog.getOpenFileName(
+            self, "Choose the aligners landmarks.json (out/surgery/)", "", "Aligners landmarks (*.json)"
+        )
+        if not source:
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export aligner movements", "movements.toml", "TOML (*.toml)"
+        )
+        if not path:
+            return
+        if not path.lower().endswith(".toml"):
+            path += ".toml"
+        from .aligners import export_aligner_movements
+
+        try:
+            exported = export_aligner_movements(self.doc, source, path)
+        except Exception as error:
+            self._error(str(error) or "Could not export aligner movements.")
+            return
+        self._status(f"Aligner movements exported: {exported}")
 
     def _job_finished(self, operation, revision, result):
         if "_control_session" in result:
