@@ -1,6 +1,6 @@
 # BIMAX
 
-Explore jaw movements in 3D from a binary bone volume. BIMAX is a Linux desktop app for separating the upper and lower jaws, defining geometric cuts, and comparing movement scenarios in slice and 3D views.
+Explore jaw movements in 3D from a binary bone volume. BIMAX is a Linux desktop app for separating the upper and lower jaws, defining geometric cuts, and comparing movement scenarios in slice and 3D views. The headless `bimax-cli` lets AI agents and scripts plan, preview and export from the same projects.
 
 It supports reusable Le Fort I, II and III cuts, editable modified II and III variants, bilateral sagittal split osteotomy (BSSO), and genioplasty. Nested upper-jaw cuts can be combined, such as Le Fort III + I. This is a geometric exploration tool. Bone-interference detection, joint biomechanics, soft-tissue prediction, and clinical feasibility assessment are outside its scope. It does not predict fractures or bite.
 
@@ -20,7 +20,7 @@ Install or update to the latest release:
 curl -fsSL https://raw.githubusercontent.com/kaufmann-dev/bimax-simulation/main/install | bash
 ```
 
-The installer downloads Python 3.14 if needed, installs BIMAX into its own environment with the versions pinned in `uv.lock`, and adds the `bimax` and `bimax-mcp` commands, application launcher, icon, AppStream metadata, and `.bimax` file association. Run the same command again to update after a new release. Confirm that the user copy wins:
+The installer downloads Python 3.14 if needed, installs BIMAX into its own environment with the versions pinned in `uv.lock`, and adds the `bimax` and `bimax-cli` commands, application launcher, icon, AppStream metadata, and `.bimax` file association. Run the same command again to update after a new release. Confirm that the user copy wins:
 
 ```sh
 command -v bimax
@@ -102,7 +102,7 @@ Measurements use the planning frame and are independent of camera position and w
 bimax /path/to/simulation.bimax
 ```
 
-Projects use `.bimax` format version 5 and persist symmetry references, measurement definitions, proximal pivots and rotations. Earlier formats are rejected; this app does not provide a migration path. Editing sessions, jobs, and preview IDs are transient.
+Projects use `.bimax` format version 5 and persist symmetry references, measurement definitions, proximal pivots and rotations. Earlier formats are rejected; this app does not provide a migration path. Undo history and background jobs are transient.
 
 Overwriting an existing project creates a timestamped `.backup-<UTC timestamp>.bimax` copy first. Saves use atomic replacement and reject external changes detected since the project was opened or saving began. Use another filename for Save As when resolving a conflict.
 
@@ -118,35 +118,26 @@ Overwriting an existing project creates a timestamped `.backup-<UTC timestamp>.b
 - **Values:** each landmark's displacement from the scanned occlusion, in millimetres along the aligners head axes: `forward_mm`, `up_mm` and `left_mm`. Note that `left_mm` is positive toward the patient's left, unlike the report's transverse column.
 - **Rejected:** a combination that is not accepted, landmarks farther than 3 mm from their jaw bone, and dentitions split across fragments by a cut.
 
-## Local MCP control
+## Command line for agents and scripts
 
-Configure an MCP client with the installed stdio server. The official Python SDK is pinned to `mcp==2.3.0`; diagnostics go to stderr. For this checkout's installation:
+`bimax-cli` plans, previews and exports from a `.bimax` project without a display or a running app, so an AI agent can drive it from a terminal. List the commands with `bimax-cli --help`, and each command's options with `bimax-cli COMMAND --help`. Every command takes the project path and prints one JSON document on stdout. On failure it prints `{"error": "..."}` and exits with status 1.
 
-```json
-{
-  "mcpServers": {
-    "bimax-simulation": {
-      "command": "/home/david/.local/bin/bimax-mcp"
-    }
-  }
-}
-```
+- **Inspect:** `inspect` lists scenarios, the seven shared cuts and their geometry, movements, pivots, landmarks, fragments, confirmations and acceptance. `measurements --scenario NAME` adds the symmetry results.
+- **Edit:** `create-scenario`, `select-scenario`, `select-cuts`, `replace-cut`, `set-movement`, `reset-pivot`, `set-proximal`, `reset-proximal`, `set-symmetry`, `set-measurement`, `remove-measurement`, `set-orientation`, `set-landmark`, `remove-landmark` and `confirm-fragment`.
+  - They apply the desktop app's validation.
+  - Scenario-owned edits need `--scenario NAME`.
+  - `batch PROJECT edits.json` applies a JSON list of these operations with one save, or none of them if any fails.
+- **Review:**
+  - `prepare` builds the scenario's fragments and lists empty fragments and missing confirmation points.
+  - `preview --out sheet.png` renders the contact sheet (right, left, front, bird's-eye), one 3D view, or an axial, coronal or sagittal slice at `--position` mm.
+  - `pick --view V --x X --y Y` returns the fragment and baseline point at normalized top-left image coordinates, also within a contact-sheet tile. Use it for confirmation points, pivots and landmarks.
+  - `accept` checks and accepts the combination.
+  - Unaccepted previews are marked `unreviewed`.
+- **Export:** `export-labelmaps`, `export-images`, `export-report` and `export-aligners` write the same files as the desktop exports. Case details for the report are passed as options and never saved.
 
-On another machine, replace the command with that user's absolute `~/.local/bin/bimax-mcp` path. BIMAX and the MCP client must run as the same user in the same graphical desktop environment. The private Unix socket lives under `$XDG_RUNTIME_DIR/bimax` (or `/run/user/<uid>/bimax`); its directory is owner-only and socket permissions are 0600.
+Points are baseline planning Right/Anterior/Superior millimetres. Rotations are pitch, roll and yaw in degrees, applied as `Rz(yaw) Ry(roll) Rx(pitch)` about the pivot. Distal movements keep their parent-relative inheritance; proximal rotations have none.
 
-The server discovers running instances, attaches when exactly one exists, and launches the installed `~/.local/bin/bimax` when none exists. When several instances exist, call `discover_instances` and choose an `instance_id` with `connect_instance`.
-
-When a client such as Codex filters desktop environment variables, the server restores the missing display and authentication variables from the systemd user session before launching BIMAX. It imports only desktop connection variables. If the graphical session is unavailable, start BIMAX from the desktop before connecting or pass `DISPLAY` and `XAUTHORITY` explicitly in the client's MCP environment configuration. Startup crashes are reported immediately with diagnostics on stderr.
-
-A typical interaction is: connect → inspect state → begin a session → open an absolute version 5 `.bimax` path → edit a named scenario → preview → revise → explicitly save → end the session. Mutations require the current `session_id`, `document_id`, and `revision`. Scenario-owned edits require explicit scenario names. Stale commands are rejected; inspect state to get fresh guards.
-
-Typed tools cover scenarios, shared cut replacement, atomic movements, independent proximal rotations and resets, orientation, named landmark creation/update/removal, the symmetry reference, measurement definitions and baseline/moved results, fragment confirmations, explicit combination acceptance, undo, redo, opening and saving. Public points use baseline planning Right/Anterior/Superior coordinates in millimetres. Rotations use named pitch, roll and yaw in degrees, in engine order `Rz(yaw) Ry(roll) Rx(pitch)`. Distal movements retain parent-relative inheritance; proximal rotations have none.
-
-`preview` returns a job ID immediately. Poll `job_status` for progress and the real PNG image content, or use `cancel_job`. The default 1024-pixel contact sheet contains right, left, front and bird's-eye views; individual views and axial, coronal or sagittal slices are available. Slice positions are in millimetres along the planning normal rotated by the saved display orientation. `pick_image_point` takes a preview ID, view name and normalized top-left image coordinates and returns a fragment identity and baseline point. For a contact sheet, coordinates are relative to its individual view. Picking rejects old document revisions.
-
-Provisional movement previews are marked **unreviewed** and do not accept cuts. Supply confirmation points and call `accept_combination` explicitly. Saving a provisional scenario persists its edits without accepting it; provisional display geometry remains transient. Manual image exports remain 2048 pixels per view.
-
-During a session, the **AI editing** banner shows the current scenario. Project changes, painting, planning controls, saving, undo and redo are read-only; navigation, slice browsing, zoom and visibility inspection remain available. **Take control** revokes the session and cancels active work while preserving completed edits and undo history. Explicit session completion, disconnect, shutdown, or five minutes without a request or active job releases the lock. Releasing it never saves automatically. Saving requires an explicit absolute filename; opening another project is refused while unsaved changes exist.
+Edits save the project in place, atomically and without backups; copy the project first if you want to keep a version. A save is refused if the file changed since the command read it. The desktop app likewise refuses to overwrite a project the CLI changed while it was open, so reopen it to see the changes. Previews and exports do not change the project. Images render offscreen, through EGL when there is no display server.
 
 ## Run from source
 
@@ -159,7 +150,7 @@ uv run bimax
 
 ## Publish a release
 
-Set the new version in `pyproject.toml`, the first `<release>` in `packaging/linux/app.bimax.simulator.metainfo.xml`, and the MCP server version in `src/bimax/mcp_server.py`, then run `uv lock`. After the commit is on `main`, tag and push it:
+Set the new version in `pyproject.toml` and the first `<release>` in `packaging/linux/app.bimax.simulator.metainfo.xml`, then run `uv lock`. After the commit is on `main`, tag and push it:
 
 ```sh
 git tag v0.2.0

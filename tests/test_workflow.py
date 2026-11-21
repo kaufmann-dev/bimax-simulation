@@ -490,6 +490,23 @@ def test_native_import_separate_cut_move_save_reopen_export(window, qapp, tmp_pa
     assert len(list((tmp_path / "labelmaps").glob("*.nii.gz"))) == 6
 
 
+class FakeScene:
+    """Stands in for the offscreen export scene of the displayed fragments."""
+
+    def __init__(self, recorded, exported):
+        self.recorded, self.exported = recorded, exported
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return None
+
+    def export_scenario_images(self, path):
+        self.recorded.append(path)
+        return self.exported
+
+
 def test_export_scenario_images_uses_active_scene_and_does_not_dirty_project(
     window, tmp_path, monkeypatch
 ):
@@ -500,11 +517,7 @@ def test_export_scenario_images_uses_active_scene_and_does_not_dirty_project(
     recorded = []
     monkeypatch.setattr(QFileDialog, "getExistingDirectory", lambda *args: str(tmp_path))
     monkeypatch.setattr(QInputDialog, "getText", lambda *args, **kwargs: ("bimax-images", True))
-    monkeypatch.setattr(
-        window.views,
-        "export_scenario_images",
-        lambda path: recorded.append(path) or expected,
-    )
+    monkeypatch.setattr(window.views, "export_scene", lambda: FakeScene(recorded, expected))
 
     window._export_images()
 
@@ -524,13 +537,16 @@ def test_export_scenario_report_passes_case_details_and_does_not_dirty_project(
     recorded = []
     monkeypatch.setattr(window, "_case_details", lambda: case)
     monkeypatch.setattr(QFileDialog, "getSaveFileName", lambda *args: (str(tmp_path / "plan"), "PDF (*.pdf)"))
+    scene = FakeScene([], [])
+    monkeypatch.setattr(window.views, "export_scene", lambda: scene)
     monkeypatch.setattr(
-        report, "export_report", lambda views, doc, path, **kwargs: recorded.append((path, kwargs)) or path
+        report, "export_report",
+        lambda used, doc, path, **kwargs: recorded.append((used is scene, path, kwargs)) or path
     )
 
     window._export_report()
 
-    assert recorded == [(str(tmp_path / "plan.pdf"), {"project_path": None, "dirty": False, "case": case})]
+    assert recorded == [(True, str(tmp_path / "plan.pdf"), {"project_path": None, "dirty": False, "case": case})]
     assert "Scenario report exported" in window.statusBar().currentMessage()
     assert not window.dirty
 

@@ -11,12 +11,11 @@ dependencies = [
   "PySide6-Essentials==6.12.0",
   "vtk==9.7.2",
   "psutil>=7.2,<8",
-  "mcp==2.3.0",
 ]
 
 [project.scripts]
 bimax = "bimax.app:main"
-bimax-mcp = "bimax.mcp_server:main"
+bimax-cli = "bimax.cli:main"
 
 [build-system]
 requires = ["hatchling"]

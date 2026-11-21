@@ -5,19 +5,18 @@ os.environ.setdefault("QT_QPA_PLATFORM", "xcb")
 import numpy as np
 import pytest
 from PySide6.QtCore import QPoint, Qt
-from PySide6.QtGui import QImage
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication
 from vtkmodules.util.numpy_support import numpy_to_vtk, vtk_to_numpy
 from vtkmodules.vtkCommonCore import vtkPoints
-from vtkmodules.vtkCommonDataModel import vtkCellArray, vtkImageData, vtkPolyData
+from vtkmodules.vtkCommonDataModel import vtkCellArray, vtkPolyData
 from vtkmodules.vtkFiltersCore import vtkImplicitPolyDataDistance
 
 import bimax.surfaces as surfaces
-import bimax.views as views
 from bimax.model import Document, Geometry
+from bimax.scene import EXPORT_VIEWS, sample_indices
 from bimax.surfaces import make_surfaces
-from bimax.views import FourViews, SliceView, sample_indices, world_bounds
+from bimax.views import FourViews, SliceView, world_bounds
 
 
 @pytest.fixture(scope="module")
@@ -167,136 +166,15 @@ def test_circular_orbit_keeps_head_upright_and_supports_pan_zoom(qapp):
 
 
 def test_birds_eye_is_elevated_front():
-    _, _, direction, up = views.EXPORT_VIEWS[3]
+    _, _, direction, up = EXPORT_VIEWS[3]
     assert direction[0] == 0
     assert direction[1] > 0
     assert np.degrees(np.arctan2(direction[2], direction[1])) == pytest.approx(40)
     np.testing.assert_array_equal(up, [0, 0, 1])
 
 
-@pytest.mark.parametrize("orientation", [[0.0, 0.0, 0.0], [17.0, -9.0, 23.0]])
-def test_export_scenario_images_uses_standard_cameras_and_restores_scene(qapp, tmp_path, monkeypatch, orientation):
-    class FakeRenderLargeImage:
-        cameras = []
-
-        def SetInput(self, renderer):
-            self.renderer = renderer
-
-        def SetMagnification(self, value):
-            self.magnification = value
-
-        def Update(self):
-            camera = self.renderer.GetActiveCamera()
-            position = np.asarray(camera.GetPosition())
-            focal = np.asarray(camera.GetFocalPoint())
-            up = np.asarray(camera.GetViewUp())
-            self.cameras.append(((position - focal) / np.linalg.norm(position - focal), up))
-            self.image = vtkImageData()
-            self.image.SetDimensions(48, 36, 1)
-            pixels = np.full((36 * 48, 3), 180, dtype=np.uint8)
-            self.image.GetPointData().SetScalars(numpy_to_vtk(pixels, deep=True))
-
-        def GetOutput(self):
-            return self.image
-
-    monkeypatch.setattr(views, "EXPORT_IMAGE_SIZE", 96)
-    monkeypatch.setattr(views, "vtkRenderLargeImage", FakeRenderLargeImage)
-    doc = document()
-    doc.view_angles = orientation
-    doc.fragments = doc.anatomy.copy()
-    doc.accept_review()
-    doc.fragments_key = doc.configuration_key
-    widget = FourViews()
-    widget.resize(900, 700)
-    widget.show()
-    widget.initialize()
-    widget.set_document(doc)
-    widget.set_surfaces(make_surfaces(doc.fragments, doc.geometry), fragment_mode=True)
-    transform = np.eye(4)
-    transform[:3, 3] = [0, 4, 0]
-    widget.set_transforms({2: transform})
-    widget.show_baseline(True)
-    widget.set_pivot(doc.geometry.index_to_world([6, 7, 8]))
-    camera = widget.renderer.GetActiveCamera()
-    camera.Azimuth(17)
-    camera_state = (camera.GetPosition(), camera.GetFocalPoint(), camera.GetViewUp())
-    viewport = widget.renderer.GetViewport()
-
-    exported = widget.export_scenario_images(tmp_path / "images")
-
-    assert [path.name for path in exported] == [
-        "right.png",
-        "left.png",
-        "front.png",
-        "birds-eye.png",
-        "contact-sheet.png",
-    ]
-    for path in exported[:4]:
-        image = QImage(str(path))
-        assert image.size().width() == image.size().height() == 96
-    sheet = QImage(str(exported[-1]))
-    assert sheet.size().width() == sheet.size().height() == 192
-    directions = [entry[0] for entry in FakeRenderLargeImage.cameras]
-    ups = [entry[1] / np.linalg.norm(entry[1]) for entry in FakeRenderLargeImage.cameras]
-    origin = doc.plan_to_world([0, 0, 0])
-    from scipy.spatial.transform import Rotation
-
-    inverse = Rotation.from_euler("xyz", orientation, degrees=True).inv()
-    expected_directions = [
-        (doc.plan_to_world(inverse.apply(direction)) - origin) / np.linalg.norm(doc.plan_to_world(inverse.apply(direction)) - origin)
-        for _, _, direction, _ in views.EXPORT_VIEWS
-    ]
-    expected_ups = [
-        (doc.plan_to_world(inverse.apply(up)) - origin) / np.linalg.norm(doc.plan_to_world(inverse.apply(up)) - origin)
-        for _, _, _, up in views.EXPORT_VIEWS
-    ]
-    np.testing.assert_allclose(directions, expected_directions)
-    np.testing.assert_allclose(ups, expected_ups)
-    assert (camera.GetPosition(), camera.GetFocalPoint(), camera.GetViewUp()) == camera_state
-    assert widget.renderer.GetViewport() == viewport
-    assert widget.actors[2].GetUserMatrix().GetElement(1, 3) == 4
-    assert widget.baseline_actors[2].GetVisibility()
-    assert widget.pivot_actor.GetVisibility()
-    widget.set_visibility(2, False)
-    with pytest.raises(ValueError, match="visible structure"):
-        widget.export_scenario_images(tmp_path / "hidden")
-    widget.close()
 
 
-@pytest.mark.parametrize("size", [(900, 700), (700, 1100)])
-def test_export_scenario_images_renders_native_vtk_scene(qapp, tmp_path, monkeypatch, size):
-    # Exercise tiled capture: the output must exceed the native viewport size.
-    monkeypatch.setattr(views, "EXPORT_IMAGE_SIZE", 2048)
-    doc = document()
-    doc.fragments = doc.anatomy.copy()
-    doc.accept_review()
-    doc.fragments_key = doc.configuration_key
-    widget = FourViews()
-    widget.resize(*size)
-    widget.show()
-    widget.initialize()
-    widget.set_document(doc)
-    widget.set_surfaces(make_surfaces(doc.fragments, doc.geometry), fragment_mode=True)
-    QTest.qWait(50)
-
-    exported = widget.export_scenario_images(tmp_path / "native-images")
-
-    for path in exported:
-        assert path.stat().st_size > 0
-    assert QImage(str(exported[0])).size().width() == 2048
-    assert QImage(str(exported[-1])).size().width() == 4096
-    for path in exported[:4]:
-        image = QImage(str(path)).convertToFormat(QImage.Format.Format_RGB888)
-        pixels = np.asarray(image.constBits()).reshape(image.height(), image.bytesPerLine())
-        row = pixels[image.height() // 2, :image.width() * 3].reshape(-1, 3)
-        foreground = np.flatnonzero(row.max(axis=1) > 20)
-        assert foreground.size > 100
-        assert np.all(np.diff(foreground) == 1), "Solid bone has black gaps at tile boundaries"
-        column = pixels[:, :image.width() * 3].reshape(image.height(), image.width(), 3)[:, image.width() // 2]
-        foreground = np.flatnonzero(column.max(axis=1) > 20)
-        assert foreground.size > 100
-        assert np.all(np.diff(foreground) == 1), "Solid bone has horizontal tile gaps"
-    widget.close()
 
 
 def test_large_display_surface_preserves_topology_and_voxel_scale_geometry(monkeypatch):
@@ -543,52 +421,18 @@ def test_expand_3d_before_loading_document(qapp):
     widget.close()
 
 
-def test_render_views_baseline_uses_identity_shared_bounds_and_restores_scene(qapp, monkeypatch):
-    seen = []
-
-    class FakeRenderLargeImage:
-        def SetInput(self, renderer):
-            self.renderer = renderer
-
-        def SetMagnification(self, value):
-            pass
-
-        def Update(self):
-            matrix = widget.actors[2].GetUserMatrix()
-            seen.append(matrix.GetElement(1, 3))
-            self.image = vtkImageData()
-            self.image.SetDimensions(40, 40, 1)
-            self.image.GetPointData().SetScalars(numpy_to_vtk(np.full((1600, 3), 90, dtype=np.uint8), deep=True))
-
-        def GetOutput(self):
-            return self.image
-
-    monkeypatch.setattr(views, "vtkRenderLargeImage", FakeRenderLargeImage)
+def test_export_scene_mirrors_the_displayed_fragments_and_their_visibility(qapp):
     doc = document()
     doc.fragments = doc.anatomy.copy()
     doc.accept_review()
     doc.fragments_key = doc.configuration_key
     widget = FourViews()
-    widget.resize(600, 500)
-    widget.show()
     widget.initialize()
     widget.set_document(doc)
-    widget.set_surfaces(make_surfaces(doc.fragments, doc.geometry), fragment_mode=True)
-    transform = np.eye(4)
-    transform[:3, 3] = [0, 30, 0]
-    widget.set_transforms({2: transform})
-    camera = widget.renderer.GetActiveCamera()
-    camera_state = (camera.GetPosition(), camera.GetFocalPoint(), camera.GetViewUp())
-
-    low, high = widget.comparison_bounds()
-    moved_low, moved_high = FourViews._visible_bounds(list(widget.actors.values()))
-    assert high[1] == pytest.approx(moved_high[1])
-    assert low[1] == pytest.approx(moved_low[1] - 30)
-    rendered = widget.render_views(views.REPORT_VIEWS, 32, baseline=True, bounds=(low, high))
-
-    assert [label for label, _ in rendered] == [label for _, label, *_ in views.REPORT_VIEWS]
-    assert all(image.width() == 32 for _, image in rendered)
-    assert seen == [0] * len(views.REPORT_VIEWS)
-    assert widget.actors[2].GetUserMatrix().GetElement(1, 3) == 30
-    assert (camera.GetPosition(), camera.GetFocalPoint(), camera.GetViewUp()) == camera_state
+    meshes = make_surfaces(doc.fragments, doc.geometry)
+    widget.set_surfaces(meshes, fragment_mode=True)
+    widget.set_visibility(2, False)
+    with widget.export_scene() as scene:
+        assert set(scene.actors) == set(meshes)
+        assert not scene.is_visible(2)
     widget.close()

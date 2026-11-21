@@ -116,7 +116,6 @@ class MainWindow(QMainWindow):
 
         self.setWindowTitle("BIMAX")
         self.resize(1480, 960)
-        self.ai_control = None
         self.doc: Document | None = None
         self.project_path = None
         self.project_version = None
@@ -182,8 +181,6 @@ class MainWindow(QMainWindow):
         split.setSizes([375, 1100])
         self.setCentralWidget(split)
         self._toolbar()
-        from .control import Control
-        self.ai_control = Control(self)
         self._status("Open a binary bone volume to begin.")
         self._sync_enabled()
 
@@ -233,12 +230,6 @@ class MainWindow(QMainWindow):
         self.cancel_button.clicked.connect(self.jobs.cancel)
         toolbar.addWidget(self.cancel_button)
         self.cancel_button.hide()
-        self.ai_banner = QLabel()
-        toolbar.addWidget(self.ai_banner)
-        self.take_control_button = QPushButton("Take control")
-        self.take_control_button.clicked.connect(lambda: self.ai_control and self.ai_control.release())
-        toolbar.addWidget(self.take_control_button)
-        self.take_control_button.hide()
 
     def _expand_3d(self, expanded):
         self.views.set_3d_expanded(expanded)
@@ -541,7 +532,7 @@ class MainWindow(QMainWindow):
         self._measurement_kind_changed()
 
     def _planning_action(self, operation, **arguments):
-        if self.doc is None or self.jobs.busy or (self.ai_control and self.ai_control.session):
+        if self.doc is None or self.jobs.busy:
             return
         try:
             self._command(operation, **arguments)
@@ -671,8 +662,6 @@ class MainWindow(QMainWindow):
     def _error(self, message):
         self._after_save = None
         self._status(message)
-        if self.ai_control and self.ai_control.session:
-            return
         QMessageBox.warning(self, "BIMAX", message)
 
     def _busy_changed(self, busy):
@@ -709,15 +698,14 @@ class MainWindow(QMainWindow):
     def _sync_enabled(self):
         has_doc = self.doc is not None
         busy = self.jobs.busy
-        locked = bool(self.ai_control and self.ai_control.session)
-        self.tabs.setEnabled(not busy and not locked)
-        self.scenario_combo.setEnabled(has_doc and not busy and not locked)
+        self.tabs.setEnabled(not busy)
+        self.scenario_combo.setEnabled(has_doc and not busy)
         for spin in self.orientation_spins:
             spin.setEnabled(has_doc and not busy)
         for name, action in (
             self.toolbar_actions.items() if hasattr(self, "toolbar_actions") else []
         ):
-            action.setEnabled((not busy and not locked and (has_doc or name in ("Import volume", "Open project"))) or name == "Right profile")
+            action.setEnabled((not busy and (has_doc or name in ("Import volume", "Open project"))) or name == "Right profile")
         for index in range(1, 4):
             self.tabs.setTabEnabled(index, has_doc)
         if hasattr(self, "accept_separation_button"):
@@ -788,10 +776,7 @@ class MainWindow(QMainWindow):
         self._load_document_controls()
         if operation == "set_orientation":
             self.views.profile_view()
-        if self.ai_control and self.ai_control.session:
-            self.ai_control.show_scene()
-        else:
-            self._activate_scene()
+        self._activate_scene()
         self._sync_enabled()
 
     def _mark_dirty(self):
@@ -910,8 +895,6 @@ class MainWindow(QMainWindow):
         self.loading = previous
 
     def _select_cut(self, cut_id, enabled):
-        if self.ai_control and self.ai_control.session:
-            return
         if self.loading or self.doc is None or self.jobs.busy:
             return
         selected = list(self.doc.scenario.cut_ids)
@@ -943,8 +926,6 @@ class MainWindow(QMainWindow):
         return result == QMessageBox.StandardButton.Discard
 
     def import_volume(self):
-        if self.ai_control and self.ai_control.session:
-            return
         if self.jobs.busy or not self._confirm_replace():
             return
         path, _ = QFileDialog.getOpenFileName(
@@ -954,8 +935,6 @@ class MainWindow(QMainWindow):
             self.load_path(path)
 
     def open_project(self):
-        if self.ai_control and self.ai_control.session:
-            return
         if self.jobs.busy or not self._confirm_replace():
             return
         path, _ = QFileDialog.getOpenFileName(self, "Open project", "", "BIMAX project (*.bimax)")
@@ -969,8 +948,6 @@ class MainWindow(QMainWindow):
         self._status("Loading volume and extracting display surfaces…")
 
     def save_project(self, save_as=False):
-        if self.ai_control and self.ai_control.session:
-            return
         if self.doc is None or self.jobs.busy:
             return
         path = self.project_path
@@ -1022,7 +999,8 @@ class MainWindow(QMainWindow):
         self._status("Rendering standardized scenario views…")
         QApplication.setOverrideCursor(QCursor(Qt.CursorShape.WaitCursor))
         try:
-            exported = self.views.export_scenario_images(Path(parent) / name)
+            with self.views.export_scene() as scene:
+                exported = scene.export_scenario_images(Path(parent) / name)
         except Exception as error:
             failure = str(error) or "Could not export scenario images."
         else:
@@ -1077,9 +1055,10 @@ class MainWindow(QMainWindow):
         self._status("Rendering pre-op and planned views for the report…")
         QApplication.setOverrideCursor(QCursor(Qt.CursorShape.WaitCursor))
         try:
-            exported = export_report(
-                self.views, self.doc, path, project_path=self.project_path, dirty=self.dirty, case=case
-            )
+            with self.views.export_scene() as scene:
+                exported = export_report(
+                    scene, self.doc, path, project_path=self.project_path, dirty=self.dirty, case=case
+                )
         except Exception as error:
             failure = str(error) or "Could not export the scenario report."
         else:
@@ -1119,16 +1098,6 @@ class MainWindow(QMainWindow):
         self._status(f"Aligner movements exported: {exported}")
 
     def _job_finished(self, operation, revision, result):
-        if "_control_session" in result:
-            control = self.ai_control
-            if not control or result["_control_session"] != control.session or result["_control_job"] != control.active_job:
-                self._status("Discarded a result from a revoked editing session.")
-                return
-            if not control.owns_result(operation, revision, result):
-                self._status("Discarded an outdated AI computation result.")
-                return
-            if operation in ("cuts_preview", "load_prepared"):
-                return  # Control publishes provisional geometry without accepting it.
         if operation not in ("import", "open") and self.doc is None:
             return
         if operation not in ("import", "open") and self.doc and operation != "load_prepared" and revision != self.doc.revision:
@@ -1279,8 +1248,6 @@ class MainWindow(QMainWindow):
         )
 
     def _tool_changed(self):
-        if self.ai_control and self.ai_control.session:
-            return
         tool = self.tool_combo.currentData()
         self.pick_mode = "component" if tool == "component" else None
         visual_tool = {"component": "pick", "unbarrier": "barrier", "unseed": "seed"}.get(
@@ -1290,8 +1257,6 @@ class MainWindow(QMainWindow):
         self.views.set_label(self.label_combo.currentData())
 
     def _paint(self, payload):
-        if self.ai_control and self.ai_control.session:
-            return
         if self.doc is None or self.jobs.busy or self.tabs.currentIndex() != 1:
             return
         indices = np.unique(payload["indices"])
@@ -1539,8 +1504,6 @@ class MainWindow(QMainWindow):
                 "reviews": deepcopy(self.doc.reviews)}
 
     def _plane_controls_changed(self):
-        if self.ai_control and self.ai_control.session:
-            return
         if self.loading or self.doc is None:
             return
         normal = np.array([s.value() for s in self.plane_normal])
@@ -1564,8 +1527,6 @@ class MainWindow(QMainWindow):
         self._show_cut_plane()
 
     def _region_changed(self):
-        if self.ai_control and self.ai_control.session:
-            return
         if self.loading or self.doc is None:
             return
         config = deepcopy(self._cut_config())
@@ -1584,8 +1545,6 @@ class MainWindow(QMainWindow):
             self._load_cut_controls()
 
     def _plane_dragged(self, origin, normal):
-        if self.ai_control and self.ai_control.session:
-            return
         if self.doc is None or self.loading or self.tabs.currentIndex() != 2:
             return
         plan = self.doc.world_to_plan(origin)
@@ -1596,8 +1555,6 @@ class MainWindow(QMainWindow):
         self._plane_controls_changed()
 
     def _build_cuts(self, accepted):
-        if self.ai_control and self.ai_control.session:
-            return
         if self.doc is None or self.jobs.busy:
             return
         if accepted:
@@ -1641,8 +1598,6 @@ class MainWindow(QMainWindow):
         self._status("Partitioning bone fragments at native resolution…")
 
     def _arm_pick(self, mode):
-        if self.ai_control and self.ai_control.session:
-            return
         if self.doc is None:
             return
         self.pick_mode = mode
@@ -1677,8 +1632,6 @@ class MainWindow(QMainWindow):
         return candidates[np.argmin(distance)], actor
 
     def _point_picked(self, point):
-        if self.ai_control and self.ai_control.session:
-            return
         if self.doc is None or self.jobs.busy:
             return
         self.last_point = point
@@ -1759,8 +1712,6 @@ class MainWindow(QMainWindow):
             self.views.set_tool("navigate")
 
     def _orientation_changed(self):
-        if self.ai_control and self.ai_control.session:
-            return
         if self.loading or self.doc is None or self.jobs.busy:
             return
         angles = [spin.value() for spin in self.orientation_spins]
@@ -1775,8 +1726,6 @@ class MainWindow(QMainWindow):
         self._orientation_changed()
 
     def _frame_changed(self):
-        if self.ai_control and self.ai_control.session:
-            return
         if self.loading or self.doc is None:
             return
         from scipy.spatial.transform import Rotation
@@ -1845,8 +1794,6 @@ class MainWindow(QMainWindow):
         self._sync_enabled()
 
     def _motion_changed(self):
-        if self.ai_control and self.ai_control.session:
-            return
         if self.loading or self.doc is None or self.doc.fragments is None:
             return
         if self._motion_before is None:
@@ -1914,8 +1861,6 @@ class MainWindow(QMainWindow):
         self._show_measurement_results()
 
     def _share_pivot(self):
-        if self.ai_control and self.ai_control.session:
-            return
         if self.doc is None:
             return
         if self.motion_combo.currentData() in PROXIMAL_IDS:
@@ -1929,8 +1874,6 @@ class MainWindow(QMainWindow):
                       action_label="Share pivot")
 
     def _reset_pivot(self):
-        if self.ai_control and self.ai_control.session:
-            return
         if self.doc is None or self.jobs.busy:
             return
         self._finish_motion_edit()
@@ -1951,8 +1894,6 @@ class MainWindow(QMainWindow):
         self._status("Pivot and rotation reset; translation retained.")
 
     def _reset_motion(self):
-        if self.ai_control and self.ai_control.session:
-            return
         if self.doc is None:
             return
         if self.motion_combo.currentData() in PROXIMAL_IDS:
@@ -1965,8 +1906,6 @@ class MainWindow(QMainWindow):
                           }}, action_label="Reset movement")
 
     def _scenario_changed(self, name):
-        if self.ai_control and self.ai_control.session:
-            return
         if (
             self.loading
             or self.doc is None
@@ -1978,8 +1917,6 @@ class MainWindow(QMainWindow):
         self._command("select_scenario", name)
 
     def _duplicate_scenario(self):
-        if self.ai_control and self.ai_control.session:
-            return
         if self.doc is None:
             return
         name, ok = QInputDialog.getText(
@@ -1997,8 +1934,6 @@ class MainWindow(QMainWindow):
         self._command("create_scenario", name=name, source=self.doc.active_scenario)
 
     def _undo(self, forward):
-        if self.ai_control and self.ai_control.session:
-            return
         if self.doc is None or self.jobs.busy:
             return
         self._finish_motion_edit()
@@ -2038,8 +1973,6 @@ class MainWindow(QMainWindow):
             self._activate_scene()
 
     def closeEvent(self, event):
-        if self.ai_control and self.ai_control.session:
-            self.ai_control.release()
         if self.jobs.busy:
             answer = QMessageBox.question(
                 self,
@@ -2074,8 +2007,6 @@ class MainWindow(QMainWindow):
                 self.save_project()
                 return
         self.jobs.close()
-        if self.ai_control:
-            self.ai_control.close()
         event.accept()
 
 

@@ -1,4 +1,4 @@
-"""Validated, atomic planning commands shared by desktop and local MCP control."""
+"""Validated, atomic planning commands shared by the desktop app and bimax-cli."""
 
 from copy import copy, deepcopy
 from dataclasses import asdict

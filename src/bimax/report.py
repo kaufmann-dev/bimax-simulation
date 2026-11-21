@@ -555,19 +555,19 @@ def write_report_pdf(path: str | Path, data: dict[str, Any], images: dict[str, t
     return destination
 
 
-def export_report(views: Any, doc: Document, path: str | Path, *, project_path: str | None,
+def export_report(scene: Any, doc: Document, path: str | Path, *, project_path: str | None,
                   dirty: bool, case: CaseInfo) -> Path:
-    """Render before/after views with shared framing and write the PDF report."""
-    from .views import REPORT_IMAGE_SIZE, REPORT_VIEWS
+    """Render before/after views of a `Scene` with shared framing and write the PDF report."""
+    from .scene import REPORT_IMAGE_SIZE, REPORT_VIEWS
 
-    if doc.fragments is None or not views.fragment_mode or not doc.cuts_accepted:
+    if doc.fragments is None or not scene.fragment_mode or not doc.cuts_accepted:
         raise ValueError("Review and accept the active cut combination before exporting a report.")
-    hidden = [doc.fragment_names[label] for label, actor in views.actors.items()
+    hidden = [doc.fragment_names[label] for label, actor in scene.actors.items()
               if not actor.GetVisibility() and label in doc.fragment_names]
     data = report_data(doc, project_path=project_path, dirty=dirty, case=case, hidden=hidden)
-    bounds = views.comparison_bounds()
-    pre = views.render_views(REPORT_VIEWS, REPORT_IMAGE_SIZE, baseline=True, bounds=bounds)
-    post = views.render_views(REPORT_VIEWS, REPORT_IMAGE_SIZE, bounds=bounds)
+    bounds = scene.comparison_bounds()
+    pre = scene.render_views(REPORT_VIEWS, REPORT_IMAGE_SIZE, baseline=True, bounds=bounds)
+    post = scene.render_views(REPORT_VIEWS, REPORT_IMAGE_SIZE, bounds=bounds)
     images = {label: crop_pair(pre_image, post_image)
               for (label, pre_image), (_, post_image) in zip(pre, post, strict=True)}
     return write_report_pdf(path, data, images)

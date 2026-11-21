@@ -374,8 +374,11 @@ def file_version(path: str | Path) -> list[int] | None:
 _UNSPECIFIED = object()
 
 
-def save_project(doc: Document, path: str | Path, *, expected_version: Any = _UNSPECIFIED) -> None:
-    """Save source-of-truth state plus current prepared artifacts atomically."""
+def save_project(
+    doc: Document, path: str | Path, *, expected_version: Any = _UNSPECIFIED, backup: bool = True
+) -> None:
+    """Save source-of-truth state plus current prepared artifacts atomically. With `backup`, an
+    overwritten project is first copied to a timestamped .backup-<UTC>.bimax file."""
     from bimax.engine import validate_fragment_preview
     from bimax.prepared import MAX_ARTIFACT_BYTES, prepare_geometry, prune_references, read
 
@@ -424,10 +427,10 @@ def save_project(doc: Document, path: str | Path, *, expected_version: Any = _UN
             os.fsync(stream.fileno())
         if file_version(destination) != expected_version:
             raise ValueError("External file conflict. Reopen the project or save to another filename.")
-        if expected_version is not None:
+        if backup and expected_version is not None:
             stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S.%fZ")
-            backup = destination.with_name(f"{destination.stem}.backup-{stamp}.bimax")
-            with destination.open("rb") as original, backup.open("xb") as copy_stream:
+            copy_path = destination.with_name(f"{destination.stem}.backup-{stamp}.bimax")
+            with destination.open("rb") as original, copy_path.open("xb") as copy_stream:
                 shutil.copyfileobj(original, copy_stream)
                 copy_stream.flush()
                 os.fsync(copy_stream.fileno())
